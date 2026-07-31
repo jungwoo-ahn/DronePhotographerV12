@@ -324,6 +324,31 @@ def iter_multiscale_windows(
 
 DEFAULT_GOAL_OCCUPANCY_RANGE = (20.0, 80.0)
 DEFAULT_DELTA_RANGE = (8, 32)
+# Occupancy alone does NOT mean "well framed": it comes from the UNCLIPPED mesh-tight
+# bbox, so a subject can fill 40% of the frame while hanging half outside it. Measured
+# over goals that pass occupancy 20-80: body_in_frame median 34 (i.e. two thirds of the
+# body out of frame) and the subject's centre off-screen in 35% of them. These two extra
+# gates are what actually make a goal a photograph.
+DEFAULT_MIN_GOAL_BODY_IN_FRAME = 70.0
+
+
+def _is_well_framed(
+    raw: dict, min_body_in_frame: float, require_center_on_screen: bool
+) -> bool:
+    """Composition gates a goal frame must pass on top of its occupancy band."""
+    if not isinstance(raw, dict):
+        return False
+    if min_body_in_frame > 0.0:
+        body = raw.get("body_in_frame_ratio")
+        if body is None or float(body) < min_body_in_frame:
+            return False
+    if require_center_on_screen:
+        cx, cy = raw.get("object_center_x"), raw.get("object_center_y")
+        if cx is None or cy is None:
+            return False
+        if not (0.0 <= float(cx) <= RENDER_WIDTH and 0.0 <= float(cy) <= RENDER_HEIGHT):
+            return False
+    return True
 
 
 def iter_goal_start_windows(
@@ -332,6 +357,8 @@ def iter_goal_start_windows(
     chunk_size: int = 8,
     delta_range: tuple[int, int] = DEFAULT_DELTA_RANGE,
     goal_occupancy_range: tuple[float, float] = DEFAULT_GOAL_OCCUPANCY_RANGE,
+    min_goal_body_in_frame: float = DEFAULT_MIN_GOAL_BODY_IN_FRAME,
+    require_goal_center_on_screen: bool = True,
     min_start_occupancy: float = 1.0,
     max_per_pair: int = 0,
     seed: int = 0,
@@ -344,9 +371,12 @@ def iter_goal_start_windows(
     (measured over all 42840). A terminal goal would be mostly "subject not visible".
 
     So, per trajectory:
-      * goal g — any frame whose occupancy is in `goal_occupancy_range`. The upper
-        bound drops saturated close-ups as well as the empty tail, leaving goals that
-        are actually well-composed shots.
+      * goal g — a WELL-FRAMED frame: occupancy in `goal_occupancy_range` (the upper
+        bound drops saturated close-ups, the lower one the empty tail), at least
+        `min_goal_body_in_frame` percent of the body inside the frame, and (by default)
+        the subject's centre actually on screen. The last two gates matter: occupancy
+        is computed from the unclipped bbox, so on its own it admits subjects hanging
+        half out of frame (see DEFAULT_MIN_GOAL_BODY_IN_FRAME).
       * start s — any frame with `delta_range[0] <= |g - s| <= delta_range[1]` whose
         occupancy exceeds `min_start_occupancy`, so the policy never has to act from a
         frame where the subject is invisible. Both signs are used, which gives the
@@ -389,6 +419,10 @@ def iter_goal_start_windows(
         for g in range(n):
             og = occupancy[g]
             if og is None or not (occ_lo <= float(og) <= occ_hi):
+                continue
+            if not _is_well_framed(
+                view_records[g].raw, min_goal_body_in_frame, require_goal_center_on_screen
+            ):
                 continue
             for s in range(n):
                 delta = abs(g - s)

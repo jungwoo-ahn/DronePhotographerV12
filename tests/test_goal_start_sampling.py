@@ -26,6 +26,17 @@ CHUNK = 8
 
 @pytest.fixture(scope="module")
 def windows():
+    """Scheme mechanics only — composition gates off, so one placement still yields
+    enough windows to exercise delta / chunk / direction."""
+    return list(iter_goal_start_windows(
+        DATA, chunk_size=CHUNK, min_goal_body_in_frame=0.0,
+        require_goal_center_on_screen=False,
+    ))
+
+
+@pytest.fixture(scope="module")
+def framed_windows():
+    """Default (production) gates: occupancy band + body-in-frame + centre on screen."""
     return list(iter_goal_start_windows(DATA, chunk_size=CHUNK))
 
 
@@ -33,10 +44,26 @@ def test_scheme_yields_windows(windows):
     assert len(windows) > 100
 
 
-def test_every_goal_is_well_framed(windows):
+def test_every_goal_is_in_the_occupancy_band(windows):
     lo, hi = DEFAULT_GOAL_OCCUPANCY_RANGE
     for w in windows:
         assert lo <= float(w.goal_frame.raw["occupancy"]) <= hi
+
+
+def test_composition_gate_keeps_only_well_framed_goals(framed_windows, windows):
+    """Occupancy alone admits subjects hanging out of frame — these gates are what
+    make a goal a photograph (median body_in_frame was 34 without them)."""
+    assert 0 < len(framed_windows) < len(windows)
+    for w in framed_windows:
+        raw = w.goal_frame.raw
+        assert float(raw["body_in_frame_ratio"]) >= 70.0
+        assert 0.0 <= float(raw["object_center_x"]) <= 1024.0
+        assert 0.0 <= float(raw["object_center_y"]) <= 768.0
+
+
+def test_composition_gate_can_be_disabled(windows):
+    loose_bodies = [float(w.goal_frame.raw["body_in_frame_ratio"]) for w in windows]
+    assert min(loose_bodies) < 70.0          # the gate really is off in this fixture
 
 
 def test_start_always_sees_the_subject(windows):
@@ -68,8 +95,10 @@ def test_scheme_is_bidirectional(windows):
 
 
 def test_cap_is_deterministic_and_respected():
-    a = list(iter_goal_start_windows(DATA, chunk_size=CHUNK, max_per_pair=15))
-    b = list(iter_goal_start_windows(DATA, chunk_size=CHUNK, max_per_pair=15))
+    kw = dict(chunk_size=CHUNK, max_per_pair=15, min_goal_body_in_frame=0.0,
+              require_goal_center_on_screen=False)
+    a = list(iter_goal_start_windows(DATA, **kw))
+    b = list(iter_goal_start_windows(DATA, **kw))
     key = lambda ws: [(w.pair_idx, w.start_frame_idx, w.goal_frame.frame_idx) for w in ws]
     assert key(a) == key(b)
     per_pair: dict[int, int] = {}
@@ -97,3 +126,29 @@ def test_dataset_produces_9d_actions_and_a_subject_frame_goal():
     assert s.action_chunk.shape == (CHUNK, 9)
     bearing = s.goal_vec[DEFAULT_GOAL_KEYS.index(SUBJECT_BEARING_KEY)]
     assert 0.0 <= float(bearing) < 360.0
+
+
+def test_bearing_balanced_weights_even_out_the_view_sectors():
+    """The raw sector mix is heavily skewed (back ~31%, front ~4%, left ~1% measured
+    over 400 placements), so the sampler weights rather than discards."""
+    import numpy as np
+
+    from src.common.dataset_base import BasePolicyDataset
+    from src.common.facing import sector8
+
+    ds = BasePolicyDataset(
+        [str(DATA.parent)], chunk_size=CHUNK, sampling_scheme="goal_start",
+        min_goal_body_in_frame=0.0, require_goal_center_on_screen=False,
+        max_windows_per_pair=40,
+    )
+    w = ds.bearing_balanced_weights()
+    assert w.shape == (len(ds),)
+    assert w.mean() == pytest.approx(1.0, abs=1e-5)
+
+    sectors = [sector8(float(b)) for b in ds.goal_bearings()]
+    mass: dict[str, float] = {}
+    for s, wt in zip(sectors, w):
+        mass[s] = mass.get(s, 0.0) + float(wt)
+    # every represented sector ends up with the same total weight
+    assert max(mass.values()) == pytest.approx(min(mass.values()), rel=1e-5)
+    assert np.isfinite(w).all()

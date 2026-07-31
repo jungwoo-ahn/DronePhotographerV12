@@ -46,6 +46,22 @@ from src.utils.rotation_utils import (
 # Current (Cosmos-native) action: [Δtranslation(3), rot6d(6)] — see `encode_action_9d`.
 ACTION_DIM = 9
 
+# The 9D action is fed RAW — no normalization. This follows Cosmos `camera_pose`
+# (translation_scale 1.0, and rot6d dims listed under `skip_rotation_dims`), and here it
+# is also the better-conditioned choice. Measured over the `goal_start` scheme
+# (151k per-step actions, scripts/fit_action_stats.py):
+#
+#   translation std   [0.080, 0.062, 0.137] m       p99|x| [0.280, 0.225, 0.599]
+#   rot6d mean        [+0.998, -0.002, +0.006, +0.003, +0.999, -0.004]  (identity!)
+#   rot6d off-diag std ~0.04                        per-step rotation 3.5 deg mean, 6.9 p99
+#
+# rot6d must NOT be scaled by a p99 of |x|: it is two columns of a rotation matrix, so
+# for our small per-step rotations it sits at the identity — dims 0 and 4 pinned near 1
+# (std 0.002) while the rest carry the signal near 0. And scaling TRANSLATION alone to
+# +-1 would bury the rotation ~50x in an L2/flow loss, exactly the DOF that aims the
+# camera. Left raw, translation (std <=0.14) and rotation (std ~0.04) sit within ~3.4x.
+ACTION_STATS_PATH = "runs/action_stats_9d.json"
+
 # Legacy 5D action dim, kept for the yaw+pitch helpers below.
 ACTION_DIM_5D = 5
 
@@ -62,6 +78,10 @@ def _forward_azimuth_elevation(forward: np.ndarray) -> tuple[float, float]:
     f = f / n
     return float(np.arctan2(f[1], f[0])), float(np.arcsin(max(-1.0, min(1.0, f[2]))))
 
+# LEGACY (5D only, and unused): these were fit for the v11 5D action under the retired
+# multiscale_bidir scheme, so they apply to neither the 9D action nor the goal_start
+# scheme. Kept only for the legacy 5D helpers; see the 9D note above for current policy.
+#
 # Per-dimension scale used to normalize the 5D action into ~[-1, 1] before it is
 # tile-injected into the Cosmos action latent frame. Each entry is the p99 of |Δ|
 # over the TRAINING sampling scheme's per-step actions: [right, up, forward (m),

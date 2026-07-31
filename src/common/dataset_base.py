@@ -37,6 +37,7 @@ import hashlib
 import itertools
 from dataclasses import dataclass
 from pathlib import Path
+from collections import Counter
 from typing import Sequence
 
 import numpy as np
@@ -51,6 +52,7 @@ from src.common.action_repr import ACTION_DIM, encode_action_9d
 from src.common.annotations import (
     DEFAULT_DELTA_RANGE,
     DEFAULT_GOAL_OCCUPANCY_RANGE,
+    DEFAULT_MIN_GOAL_BODY_IN_FRAME,
     TrajectoryWindow,
     ViewRecord,
     iter_goal_start_windows,
@@ -58,7 +60,8 @@ from src.common.annotations import (
     iter_windows,
     list_annotation_files,
 )
-from src.common.goal_space import goal_keys, goal_vector, normalize_goal
+from src.common.facing import sector8
+from src.common.goal_space import SUBJECT_BEARING_KEY, goal_keys, goal_vector, normalize_goal
 from src.common.reward import VALUE_SCALE, pose_distance_value
 
 GOAL_SAMPLING_MODES = ("uniform_future", "end")
@@ -325,6 +328,8 @@ class BasePolicyDataset(Dataset):
         offsets: Sequence[int] = DEFAULT_MULTISCALE_OFFSETS,
         delta_range: tuple[int, int] = DEFAULT_DELTA_RANGE,
         goal_occupancy_range: tuple[float, float] = DEFAULT_GOAL_OCCUPANCY_RANGE,
+        min_goal_body_in_frame: float = DEFAULT_MIN_GOAL_BODY_IN_FRAME,
+        require_goal_center_on_screen: bool = True,
         min_start_occupancy: float = 1.0,
         max_windows_per_pair: int = 0,
         value_target_mode: str = "cost_to_go",
@@ -358,6 +363,8 @@ class BasePolicyDataset(Dataset):
         self.offsets = tuple(offsets)
         self.delta_range = (int(delta_range[0]), int(delta_range[1]))
         self.goal_occupancy_range = (float(goal_occupancy_range[0]), float(goal_occupancy_range[1]))
+        self.min_goal_body_in_frame = float(min_goal_body_in_frame)
+        self.require_goal_center_on_screen = bool(require_goal_center_on_screen)
         self.min_start_occupancy = float(min_start_occupancy)
         self.max_windows_per_pair = int(max_windows_per_pair)
         self.value_target_mode = value_target_mode
@@ -372,6 +379,8 @@ class BasePolicyDataset(Dataset):
                     chunk_size=chunk_size,
                     delta_range=self.delta_range,
                     goal_occupancy_range=self.goal_occupancy_range,
+                    min_goal_body_in_frame=self.min_goal_body_in_frame,
+                    require_goal_center_on_screen=self.require_goal_center_on_screen,
                     min_start_occupancy=self.min_start_occupancy,
                     max_per_pair=self.max_windows_per_pair,
                 )
@@ -430,6 +439,36 @@ class BasePolicyDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self._entries)
+
+    def goal_bearings(self) -> np.ndarray:
+        """Per-sample subject-frame bearing of the goal, degrees (NaN if not in the goal keys).
+
+        For `goal_start` each sample has exactly one goal candidate; other schemes report
+        the first candidate.
+        """
+        try:
+            i = self.goal_keys.index(SUBJECT_BEARING_KEY)
+        except ValueError:
+            return np.full(len(self._entries), np.nan, dtype=np.float32)
+        return np.array(
+            [e.candidates[0][1][i] for e in self._entries], dtype=np.float32
+        )
+
+    def bearing_balanced_weights(self) -> np.ndarray:
+        """Per-sample weights that even out the 8-way view sectors, for a weighted sampler.
+
+        The raw data is strongly skewed — measured over well-framed goals the sectors run
+        from ~25% (right) down to ~1% (left), and FRONT views, the most useful photographic
+        goal, are among the rarest. Weighting rather than discarding keeps every sample:
+        w_i = 1 / count(sector_i), normalized to mean 1.
+        """
+        bearings = self.goal_bearings()
+        sectors = np.array(
+            [sector8(float(b)) if np.isfinite(b) else "?" for b in bearings]
+        )
+        counts = Counter(sectors.tolist())
+        w = np.array([1.0 / counts[s] for s in sectors], dtype=np.float64)
+        return (w / w.mean()).astype(np.float32)
 
     def __getitem__(self, idx: int) -> Sample:
         entry = self._entries[idx]
