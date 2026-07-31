@@ -22,6 +22,7 @@ action chunk + goal vector are computed downstream in `BasePolicyDataset`.
 from __future__ import annotations
 
 import json
+import random
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -82,6 +83,11 @@ class TrajectoryWindow:
     # frame_step. `_compute_action_chunk` / the value sequence read this list.
     frame_step: int = 1                 # real trajectory frames spanned per action (1|2|3)
     direction: int = 1                  # +1 forward along the trajectory, -1 reversed
+    goal_frame: ViewRecord | None = None
+    # `goal_start` scheme only: the goal is a well-framed frame BEYOND the window's
+    # end (delta 8..32 away), so the chunk is "the immediate steps toward the goal",
+    # not the whole path to it. The other schemes leave this None and pin the goal to
+    # `end` / the `future` pool.
 
 
 def load_annotation(path: str | Path) -> dict:
@@ -314,6 +320,114 @@ def iter_multiscale_windows(
                         frame_step=step,
                         direction=direction,
                     )
+
+
+DEFAULT_GOAL_OCCUPANCY_RANGE = (20.0, 80.0)
+DEFAULT_DELTA_RANGE = (8, 32)
+
+
+def iter_goal_start_windows(
+    data_json_path: str | Path,
+    *,
+    chunk_size: int = 8,
+    delta_range: tuple[int, int] = DEFAULT_DELTA_RANGE,
+    goal_occupancy_range: tuple[float, float] = DEFAULT_GOAL_OCCUPANCY_RANGE,
+    min_start_occupancy: float = 1.0,
+    max_per_pair: int = 0,
+    seed: int = 0,
+) -> Iterator[TrajectoryWindow]:
+    """Well-framed GOAL + a start some distance away; the chunk is the IMMEDIATE steps.
+
+    Why not the trajectory's last frame: these are RANDOM camera motions, so the
+    subject is best framed MID-trajectory and the camera then drifts past it — the
+    terminal frame has median occupancy 0 and is empty in 52% of trajectories
+    (measured over all 42840). A terminal goal would be mostly "subject not visible".
+
+    So, per trajectory:
+      * goal g — any frame whose occupancy is in `goal_occupancy_range`. The upper
+        bound drops saturated close-ups as well as the empty tail, leaving goals that
+        are actually well-composed shots.
+      * start s — any frame with `delta_range[0] <= |g - s| <= delta_range[1]` whose
+        occupancy exceeds `min_start_occupancy`, so the policy never has to act from a
+        frame where the subject is invisible. Both signs are used, which gives the
+        dolly-out direction for free (no `reverse=` augmentation needed).
+      * action chunk — the `chunk_size` steps from s TOWARD g, one trajectory frame
+        each. Since `delta_range[0] >= chunk_size` the chunk never overshoots g: the
+        policy learns "head toward the goal from here", not the whole path to it.
+
+    `max_per_pair` caps (deterministically, seeded by placement/pair) how many of a
+    trajectory's pairs are kept — the unrestricted scheme yields ~250 windows per
+    trajectory (~10.8M over the dataset), far more than a training run needs.
+    """
+    data_json_path = Path(data_json_path)
+    placement_dir = data_json_path.parent
+    doc = load_annotation(data_json_path)
+    accepted_pairs = doc.get("accepted_pairs") or []
+    render_records = doc.get("render_records") or []
+
+    d_min, d_max = int(delta_range[0]), int(delta_range[1])
+    if d_min < chunk_size:
+        raise ValueError(
+            f"delta_range lower bound {d_min} must be >= chunk_size {chunk_size} "
+            "so the action chunk cannot overshoot the goal"
+        )
+    occ_lo, occ_hi = float(goal_occupancy_range[0]), float(goal_occupancy_range[1])
+
+    for pair_idx, pair in enumerate(accepted_pairs):
+        trajectory = pair.get("trajectory_32f") or []
+        n = len(trajectory)
+        if n <= chunk_size:
+            continue
+        view_records = _pair_views(
+            doc, data_json_path, placement_dir, pair_idx, trajectory, render_records
+        )
+        occupancy = [
+            (v.raw.get("occupancy") if isinstance(v.raw, dict) else None) for v in view_records
+        ]
+
+        pairs_sg: list[tuple[int, int]] = []
+        for g in range(n):
+            og = occupancy[g]
+            if og is None or not (occ_lo <= float(og) <= occ_hi):
+                continue
+            for s in range(n):
+                delta = abs(g - s)
+                if delta < d_min or delta > d_max:
+                    continue
+                os_ = occupancy[s]
+                if os_ is None or float(os_) <= min_start_occupancy:
+                    continue
+                direction = 1 if g > s else -1
+                if not (0 <= s + direction * chunk_size < n):
+                    continue                       # unreachable given delta >= chunk_size
+                pairs_sg.append((s, g))
+
+        if max_per_pair and len(pairs_sg) > max_per_pair:
+            rng = random.Random(f"{placement_dir.name}:{pair_idx}:{seed}")
+            pairs_sg = sorted(rng.sample(pairs_sg, max_per_pair))
+
+        for s, g in pairs_sg:
+            direction = 1 if g > s else -1
+            keyframes = [view_records[s + direction * k] for k in range(chunk_size + 1)]
+            yield TrajectoryWindow(
+                annotation_path=data_json_path,
+                scene=keyframes[0].scene,
+                scene_file=keyframes[0].scene_file,
+                object=keyframes[0].object,
+                object_file=keyframes[0].object_file,
+                pair_idx=pair_idx,
+                start_frame_idx=keyframes[0].frame_idx,
+                end_frame_idx=keyframes[-1].frame_idx,
+                chunk_size=chunk_size,
+                start=keyframes[0],
+                end=keyframes[-1],
+                intermediate=keyframes[1:-1],
+                future=[],                          # goal is explicit, not an HER pool
+                keyframes=keyframes,
+                frame_step=1,
+                direction=direction,
+                goal_frame=view_records[g],
+            )
 
 
 def list_annotation_files(roots: Iterable[str | Path]) -> list[Path]:
