@@ -274,3 +274,111 @@ def rotation_quality(rotation: np.ndarray) -> tuple[float, float]:
     det_error = abs(float(np.linalg.det(rotation)) - 1.0)
     orth_error = float(np.linalg.norm(rotation.T @ rotation - np.eye(3), ord="fro"))
     return det_error, orth_error
+
+
+# ---------------------------------------------------------------------------
+# Cosmos 3 `camera_pose` interop: OpenCV camera frame + 6D rotation (rot6d).
+#
+# Cosmos expects camera-to-world (c2w) transforms in the OPENCV camera frame
+# (+X right, +Y DOWN, +Z forward), metres, and encodes a rotation as its first
+# two COLUMNS (`pose_utils.py`: col2 = cross(col0, col1), orthonormalized by an
+# SVD projection to the nearest SO(3) — not Gram-Schmidt). Blender's camera frame
+# is +X right, +Y UP, -Z forward, so the two differ by diag(1, -1, -1).
+#
+# Cosmos enforces NO roll-free / up-axis constraint (verified in the framework
+# source): rotation is free SO(3) and relative deltas compose multiplicatively,
+# so a model's predicted roll would accumulate. Our data is exactly roll-free
+# (|roll| max 0.0000 deg over 139k frames), so `project_forward_up_upright`
+# re-imposes it at decode time.
+# ---------------------------------------------------------------------------
+
+WORLD_UP_Z = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+# Blender camera axes -> OpenCV camera axes (flip Y and Z).
+BLENDER_TO_OPENCV = np.diag([1.0, -1.0, -1.0]).astype(np.float64)
+
+
+def camera_rotation_opencv_from_forward_up(forward: np.ndarray, up: np.ndarray) -> np.ndarray:
+    """Camera-to-world rotation in the OPENCV camera frame (columns = right, down, forward)."""
+    basis = make_camera_basis_from_forward_up(forward, up)          # [right, up, forward]
+    right, upn, fwd = basis[:, 0], basis[:, 1], basis[:, 2]
+    return np.stack([right, -upn, fwd], axis=1).astype(np.float64)
+
+
+def forward_up_from_camera_rotation_opencv(rotation: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Inverse of `camera_rotation_opencv_from_forward_up` -> (forward, up), world frame."""
+    r = np.asarray(rotation, dtype=np.float64)
+    forward = normalize(r[:, 2])
+    up = normalize(-r[:, 1])
+    return forward.astype(np.float32), up.astype(np.float32)
+
+
+def nearest_rotation_matrix(matrix: np.ndarray) -> np.ndarray:
+    """Project a 3x3 matrix onto the nearest rotation (SVD; det forced to +1).
+
+    Mirrors Cosmos `_normalize_rotation_matrices` so our decode matches theirs.
+    """
+    u, _, vt = np.linalg.svd(np.asarray(matrix, dtype=np.float64))
+    if np.linalg.det(u @ vt) < 0:
+        u = u.copy()
+        u[:, -1] *= -1.0
+    return (u @ vt).astype(np.float64)
+
+
+def rot6d_from_matrix(rotation: np.ndarray) -> np.ndarray:
+    """3x3 rotation -> 6D (first two COLUMNS, Cosmos convention)."""
+    r = np.asarray(rotation, dtype=np.float64)
+    return np.concatenate([r[:, 0], r[:, 1]]).astype(np.float32)
+
+
+def matrix_from_rot6d(rot6d: np.ndarray, normalize_matrix: bool = True) -> np.ndarray:
+    """6D -> 3x3 rotation: col2 = cross(col0, col1), then (optionally) project to SO(3).
+
+    `normalize_matrix=True` matters for MODEL OUTPUT, whose 6 numbers are not
+    exactly orthonormal; it is a no-op (to numerical precision) on encoded data.
+    """
+    v = np.asarray(rot6d, dtype=np.float64).reshape(-1)
+    if v.shape[0] != 6:
+        raise ValueError(f"expected 6-D rotation, got shape {v.shape}")
+    col0, col1 = v[:3], v[3:]
+    matrix = np.stack([col0, col1, np.cross(col0, col1)], axis=1)
+    return nearest_rotation_matrix(matrix) if normalize_matrix else matrix
+
+
+def project_forward_up_upright(
+    forward: np.ndarray,
+    up: np.ndarray | None = None,
+    world_up: np.ndarray = WORLD_UP_Z,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Re-impose ROLL-FREE: rebuild `up` in the vertical plane containing `forward`.
+
+    Keeps the aim (`forward`) exactly and removes any bank about it. Falls back to
+    the supplied `up` when the camera looks (near-)straight up/down, where roll is
+    ill-defined.
+    """
+    fwd = normalize(np.asarray(forward, dtype=np.float64))
+    right = np.cross(fwd, np.asarray(world_up, dtype=np.float64))
+    if np.linalg.norm(right) < 1e-6:                       # aim ~ vertical: roll undefined
+        if up is None:
+            raise ValueError("forward is parallel to world_up and no fallback up was given")
+        return orthonormalize_forward_up(fwd.astype(np.float32), np.asarray(up, dtype=np.float32))
+    right = normalize(right)
+    upright = normalize(np.cross(right, fwd))
+    return fwd.astype(np.float32), upright.astype(np.float32)
+
+
+def roll_angle_deg(
+    forward: np.ndarray, up: np.ndarray, world_up: np.ndarray = WORLD_UP_Z
+) -> float:
+    """Signed bank of `up` out of the (world_up, forward) vertical plane, in degrees.
+
+    0 for a level camera. Use it to LOG how much roll a model's raw output carries
+    before `project_forward_up_upright` removes it.
+    """
+    fwd = normalize(np.asarray(forward, dtype=np.float64))
+    upn = normalize(np.asarray(up, dtype=np.float64))
+    horiz_right = np.cross(np.asarray(world_up, dtype=np.float64), fwd)
+    if np.linalg.norm(horiz_right) < 1e-6:
+        return 0.0                                          # aim ~ vertical: roll undefined
+    horiz_right = normalize(horiz_right)
+    return float(np.degrees(np.arcsin(np.clip(float(np.dot(upn, horiz_right)), -1.0, 1.0))))

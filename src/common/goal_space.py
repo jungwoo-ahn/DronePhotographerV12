@@ -13,9 +13,20 @@ from typing import Iterable, Mapping, Sequence
 
 import numpy as np
 
+from src.common.facing import subject_bearing_deg
 from src.scoring import V5_SCORE_KEYS
 
-DEFAULT_GOAL_KEYS: list[str] = list(V5_SCORE_KEYS)
+# The goal space is the V5 profile with ONE substitution: the world-frame
+# `cam_to_obj_azimuth_deg` is replaced by the SUBJECT-frame `subject_bearing_deg`
+# (see `src/common/facing.py`). The world angle is not a usable goal — the same
+# number means "facing the camera" for one asset and "back turned" for another,
+# and the world frame is not observable from the image. The bearing is.
+WORLD_AZIMUTH_KEY = "cam_to_obj_azimuth_deg"
+SUBJECT_BEARING_KEY = "subject_bearing_deg"
+
+DEFAULT_GOAL_KEYS: list[str] = [
+    SUBJECT_BEARING_KEY if k == WORLD_AZIMUTH_KEY else k for k in V5_SCORE_KEYS
+]
 
 # v7 render resolution (scripts/v7_stage2_render.py default --resolution 1024 768).
 # The pixel-valued score keys are normalized against these. Override if the
@@ -34,7 +45,8 @@ RENDER_HEIGHT: float = 768.0
 DEFAULT_V5_RANGES: dict[str, tuple[float, float]] = {
     "occupancy": (0.0, 100.0),
     "body_in_frame_ratio": (0.0, 100.0),
-    "cam_to_obj_azimuth_deg": (0.0, 360.0),
+    SUBJECT_BEARING_KEY: (0.0, 360.0),
+    WORLD_AZIMUTH_KEY: (0.0, 360.0),
     "cam_to_obj_elevation_deg": (-90.0, 90.0),
     "object_center_x": (0.0, RENDER_WIDTH),
     "object_center_y": (0.0, RENDER_HEIGHT),
@@ -47,7 +59,7 @@ DEFAULT_V5_RANGES: dict[str, tuple[float, float]] = {
 # map to opposite ends of [-1, 1]). For the prototype we accept the seam; a
 # sin/cos encoding (which would add one dimension per cyclic key) is the proper
 # fix if azimuth conditioning proves unreliable near 0/360.
-CYCLIC_GOAL_KEYS: frozenset[str] = frozenset({"cam_to_obj_azimuth_deg"})
+CYCLIC_GOAL_KEYS: frozenset[str] = frozenset({SUBJECT_BEARING_KEY, WORLD_AZIMUTH_KEY})
 
 # Keys negated to build the point-symmetric "opposite" goal (see flip_goal):
 # elevation flips above<->below the subject; object_center mirrors about the
@@ -82,24 +94,45 @@ def goal_vector(
     keys: Sequence[str] | None = None,
     *,
     score_prefix: str = "score_",
+    object_key: str | None = None,
 ) -> np.ndarray:
     """Extract a goal vector from an annotation.
 
-    Looks for each key under the bare name first (e.g. `cam_to_obj_azimuth_deg`),
-    then under `score_<key>` (the convention written by `score_annotations.py`),
-    then under the inline mapping returned by `derive_partial_v5_from_final_image`.
-    Missing keys yield NaN.
+    Looks for each key under the bare name first (e.g. `occupancy`), then under
+    `score_<key>` (the convention written by `score_annotations.py`), then under the
+    inline mapping returned by `derive_partial_v5_from_final_image`. Missing keys
+    yield NaN.
+
+    `subject_bearing_deg` is not stored in annotations — it is derived from the raw
+    world azimuth and the asset's facing, so it needs `object_key`. Without a usable
+    object key (or for an asset missing from the facing map) it stays NaN, which the
+    dataset drops; that is deliberate — silently substituting the world angle would
+    hand the policy an ambiguous goal.
     """
     keys = goal_keys(keys)
     derived = derive_partial_v5_from_final_image(annotation_view)
+
+    def _raw(name: str) -> float | None:
+        if name in annotation_view:
+            return float(annotation_view[name])
+        if (sk := f"{score_prefix}{name}") in annotation_view:
+            return float(annotation_view[sk])
+        if name in derived:
+            return float(derived[name])
+        return None
+
     out = np.full(len(keys), np.nan, dtype=np.float32)
     for i, k in enumerate(keys):
-        if k in annotation_view:
-            out[i] = float(annotation_view[k])
-        elif (sk := f"{score_prefix}{k}") in annotation_view:
-            out[i] = float(annotation_view[sk])
-        elif k in derived:
-            out[i] = derived[k]
+        if k == SUBJECT_BEARING_KEY:
+            world_az = _raw(WORLD_AZIMUTH_KEY)
+            if world_az is not None and object_key:
+                bearing = subject_bearing_deg(world_az, object_key)
+                if bearing is not None:
+                    out[i] = bearing
+            continue
+        v = _raw(k)
+        if v is not None:
+            out[i] = v
     return out
 
 

@@ -47,7 +47,7 @@ except ImportError:  # pragma: no cover
     class Dataset:  # type: ignore[no-redef]
         pass
 
-from src.common.action_repr import ACTION_DIM, encode_action_5d
+from src.common.action_repr import ACTION_DIM, encode_action_9d
 from src.common.annotations import (
     TrajectoryWindow,
     ViewRecord,
@@ -61,6 +61,19 @@ from src.common.reward import VALUE_SCALE, pose_distance_value
 GOAL_SAMPLING_MODES = ("uniform_future", "end")
 SAMPLING_SCHEMES = ("sliding_window", "multiscale_bidir")
 DEFAULT_MULTISCALE_OFFSETS = (8, 16, 24)
+
+# Objects dropped from BOTH splits — defective data, not a train/val split concern:
+#   rp_posedplus_00068_18_100k — ~100x scale bug (subject_height 169 m vs a ~1.7 m
+#       median; turntable bounding radius 91 m), so its camera distances and action
+#       magnitudes are off-scale versus every other asset.
+#   Girls-Hugs_5d7050d8 — two people embracing, so "the subject" and its facing are
+#       ambiguous; it was also the lone front_az=180 outlier in the facing map.
+# Keyed by OBJECT (placement dir after "__"), unlike `train_exclude_names` which
+# matches whole placement dir names.
+DEFAULT_EXCLUDE_OBJECTS = frozenset({
+    "rp_posedplus_00068_18_100k",
+    "Girls-Hugs_5d7050d8",
+})
 
 # What the value latent predicts at each of the chunk_size steps:
 #   cost_to_go       — scalar −pose_distance(keyframe_k, goal) (geometric, pose-based,
@@ -112,6 +125,11 @@ def _split_key(annotation_path: Path, pair_idx: int, level: str) -> str:
     if level == "object":
         return placement.split("__")[-1]
     raise ValueError(f"val_split_level must be one of {VAL_SPLIT_LEVELS}, got {level!r}")
+
+
+def _window_object(window: TrajectoryWindow) -> str:
+    """The window's object key — same identity used by val_split_level='object'."""
+    return window.object or window.annotation_path.parent.name.split("__")[-1]
 
 
 def _is_val_pair(
@@ -186,14 +204,14 @@ def _compute_action_chunk(window: TrajectoryWindow) -> np.ndarray:
     `window.keyframes` is `[start, …, end]` — contiguous for sliding_window,
     strided by `frame_step` for multiscale_bidir. Re-encoding the action between
     strided keyframes IS the correct "merge" of `frame_step` single steps into one
-    action (camera-local 5D deltas do NOT compose additively).
+    action (camera-local deltas do NOT compose additively).
     """
     frames = window.keyframes if window.keyframes else [window.start, *window.intermediate, window.end]
     out = np.zeros((window.chunk_size, ACTION_DIM), dtype=np.float32)
     for i in range(window.chunk_size):
         prev = frames[i]
         nxt = frames[i + 1]
-        out[i] = encode_action_5d(
+        out[i] = encode_action_9d(
             np.asarray(prev.camera_position, dtype=np.float32),
             np.asarray(prev.camera_forward, dtype=np.float32),
             np.asarray(prev.camera_up, dtype=np.float32),
@@ -243,14 +261,17 @@ def _compute_value_sequence(
         return out
 
     keys = goal_keys(goal_key_list)
+    obj = _window_object(window)          # subject_bearing_deg needs the asset's facing
     achieved = np.zeros((n, len(keys)), dtype=np.float32)
     for k in range(n):
-        p = np.nan_to_num(goal_vector(frames[k].raw, keys), nan=0.0)
+        p = np.nan_to_num(goal_vector(frames[k].raw, keys, object_key=obj), nan=0.0)
         achieved[k] = normalize_goal(p, keys)
     if mode == "achieved_profile":
         return achieved
     if mode == "profile_delta":
-        g = normalize_goal(np.nan_to_num(goal_vector(goal_view.raw, keys), nan=0.0), keys)
+        g = normalize_goal(
+            np.nan_to_num(goal_vector(goal_view.raw, keys, object_key=obj), nan=0.0), keys
+        )
         return (g[None, :] - achieved).astype(np.float32)
     raise ValueError(f"value_target_mode must be one of {VALUE_TARGET_MODES}, got {mode!r}")
 
@@ -294,6 +315,7 @@ class BasePolicyDataset(Dataset):
         val_split_level: str = "pair",
         val_names: Sequence[str] | None = None,
         train_exclude_names: Sequence[str] | None = None,
+        exclude_objects: Sequence[str] | None = None,
         split: str = "train",
         augment_reverse: bool = False,
         sampling_scheme: str = "sliding_window",
@@ -315,6 +337,10 @@ class BasePolicyDataset(Dataset):
         # scene-AND-object-disjoint split (scripts/make_val_split.py) must exclude
         # so no val scene or val object ever appears in train.
         self._train_exclude = frozenset(train_exclude_names) if train_exclude_names else None
+        # Defective assets, dropped from BOTH splits (pass an empty sequence to keep them).
+        self._exclude_objects = (
+            DEFAULT_EXCLUDE_OBJECTS if exclude_objects is None else frozenset(exclude_objects)
+        )
         self.goal_keys = goal_keys(goal_score_keys)
         self.chunk_size = chunk_size
         self.stride = stride
@@ -342,6 +368,9 @@ class BasePolicyDataset(Dataset):
                     windows = itertools.chain(
                         windows, iter_windows(f, chunk_size=chunk_size, stride=stride, reverse=True))
             for window in windows:
+                # Defective assets are dropped from every split (see DEFAULT_EXCLUDE_OBJECTS).
+                if self._exclude_objects and _window_object(window) in self._exclude_objects:
+                    continue
                 # Drop scene/object crossover placements from train (leak-free split).
                 if (split == "train" and self._train_exclude is not None
                         and window.annotation_path.parent.name in self._train_exclude):
@@ -361,7 +390,7 @@ class BasePolicyDataset(Dataset):
                     pool = [window.end, *window.future]
                 candidates: list[tuple[ViewRecord, np.ndarray]] = []
                 for view in pool:
-                    g = goal_vector(view.raw, self.goal_keys)
+                    g = goal_vector(view.raw, self.goal_keys, object_key=_window_object(window))
                     if not np.isfinite(g).all():
                         continue
                     if self.filter_clamped_goals and _is_clamped(view.raw):

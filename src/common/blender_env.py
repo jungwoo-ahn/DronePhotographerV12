@@ -14,7 +14,7 @@ Design:
         rollout logic without a Blender binary.
       * (AutoPhoto will add a persistent-worker backend that keeps one Blender process
         alive for fast RL rollouts — same interface.)
-  - `BlenderRolloutEnv` holds the current pose, applies `apply_action_5d`, calls the
+  - `BlenderRolloutEnv` holds the current pose, applies `apply_action_9d`, calls the
     renderer, and exposes the cheap analytic `pose_proxy_distance` for goal scoring.
     Full rendered shot-profile scoring is wired separately at eval time (reuses the
     existing detect+score pipeline) so the env stays light and detector-free.
@@ -37,7 +37,7 @@ from typing import Optional, Sequence
 
 import numpy as np
 
-from src.common.action_repr import apply_action_5d
+from src.common.action_repr import apply_action_9d
 
 
 class Renderer(ABC):
@@ -239,7 +239,7 @@ class BlenderRolloutEnv:
     """Gym-like camera-control env over a single scene.
 
     `reset(position, forward, up)` sets the start pose (optionally rendering it);
-    `step(action_5d)` applies the 5D action, renders, and returns the new observation.
+    `step(action)` applies the 9D action, renders, and returns the new observation.
     The 5D action is in metres/radians (raw, un-normalized).
     """
 
@@ -295,11 +295,16 @@ class BlenderRolloutEnv:
         image = self.renderer.render(self.run_info_path, self.position, self.forward, self.up) if render else None
         return self._obs(image)
 
-    def step(self, action_5d: np.ndarray, *, render: bool = True) -> tuple[dict, dict]:
+    def step(self, action: np.ndarray, *, render: bool = True) -> tuple[dict, dict]:
+        """Advance one step with a 9D `[Δtranslation(3), rot6d(6)]` action.
+
+        Decoded roll-free (`upright=True`): our data has zero roll and Cosmos imposes
+        no up-axis, so a model's predicted roll would otherwise accumulate.
+        """
         if self.position is None:
             raise RuntimeError("call reset() before step()")
-        self.position, self.forward, self.up = apply_action_5d(
-            self.position, self.forward, self.up, np.asarray(action_5d, dtype=np.float32))
+        self.position, self.forward, self.up = apply_action_9d(
+            self.position, self.forward, self.up, np.asarray(action, dtype=np.float32))
         self.t += 1
         image = self.renderer.render(self.run_info_path, self.position, self.forward, self.up) if render else None
         return self._obs(image), {"t": self.t}

@@ -1,4 +1,11 @@
-"""5D camera-action representation: (Δright, Δup, Δforward, Δyaw, Δpitch).
+"""Camera-action representations.
+
+CURRENT (v12, Cosmos-native): 9D `[Δtranslation(3), rot6d(6)]` — see `encode_action_9d`
+at the bottom of this module. Full SO(3), framewise-relative, camera-local, OpenCV frame.
+
+LEGACY (v11): the 5D `(Δright, Δup, Δforward, Δyaw, Δpitch)` described below. Kept for
+comparison/ablation; note it is 2-DOF and structurally roll-free, which the 9D repr
+achieves instead by re-projecting on decode (`apply_action_9d(upright=True)`).
 
 Translation (Δright, Δup, Δforward) is in the previous frame's camera-local basis
 (Blender convention: +X=right, +Y=up, -Z=forward), in metres.
@@ -25,13 +32,22 @@ from __future__ import annotations
 import numpy as np
 
 from src.utils.rotation_utils import (
+    camera_rotation_opencv_from_forward_up,
+    forward_up_from_camera_rotation_opencv,
+    matrix_from_rot6d,
     orthonormalize_forward_up,
+    project_forward_up_upright,
     relative_translation_camera_local,
+    rot6d_from_matrix,
     rotvec_to_rotation_matrix,
     translation_camera_local_to_world,
 )
 
-ACTION_DIM = 5
+# Current (Cosmos-native) action: [Δtranslation(3), rot6d(6)] — see `encode_action_9d`.
+ACTION_DIM = 9
+
+# Legacy 5D action dim, kept for the yaw+pitch helpers below.
+ACTION_DIM_5D = 5
 
 # World up axis (Blender +Z). Yaw rotates about this so a level camera stays level.
 WORLD_UP = np.array([0.0, 0.0, 1.0], dtype=np.float64)
@@ -147,8 +163,8 @@ def decode_action_5d(action: np.ndarray) -> tuple[np.ndarray, tuple[float, float
     needs the current pose (`apply_action_5d`). This helper validates + splits.
     """
     a = np.asarray(action, dtype=np.float32).reshape(-1)
-    if a.shape[0] != ACTION_DIM:
-        raise ValueError(f"expected {ACTION_DIM}-D action, got shape {a.shape}")
+    if a.shape[0] != ACTION_DIM_5D:
+        raise ValueError(f"expected {ACTION_DIM_5D}-D action, got shape {a.shape}")
     return a[:3].astype(np.float32), (float(a[3]), float(a[4]))
 
 
@@ -166,8 +182,8 @@ def apply_action_5d(
     zero rotation preserves the orientation exactly, including at the poles.
     """
     a = np.asarray(action, dtype=np.float32).reshape(-1)
-    if a.shape[0] != ACTION_DIM:
-        raise ValueError(f"expected {ACTION_DIM}-D action, got shape {a.shape}")
+    if a.shape[0] != ACTION_DIM_5D:
+        raise ValueError(f"expected {ACTION_DIM_5D}-D action, got shape {a.shape}")
     forward = np.asarray(forward, dtype=np.float64)
     up = np.asarray(up, dtype=np.float64)
     dt = a[:3].astype(np.float64)
@@ -192,8 +208,84 @@ def apply_action_5d(
     return next_position.astype(np.float32), next_forward, next_up
 
 
+# ---------------------------------------------------------------------------
+# 9D Cosmos-native action: [Δtranslation(3), rot6d(6)]
+#
+# Matches the Cosmos `camera_pose` embodiment (domain_id 2): a FRAMEWISE-RELATIVE,
+# CAMERA-LOCAL delta of camera-to-world poses expressed in the OPENCV camera frame,
+# with the rotation as the first two columns of the relative rotation matrix.
+#
+#   dR = R0^T @ R1          (R = c2w rotation, OpenCV frame)
+#   dt = R0^T @ (p1 - p0)   (metres, in camera-local axes)
+#
+# Unlike the 5D repr this spans full SO(3), so it is lossless for any rotation --
+# and, unlike the 5D repr, it does NOT make roll structurally impossible. Our data
+# is exactly roll-free, so `apply_action_9d(..., upright=True)` re-imposes that on
+# decode (Cosmos itself enforces no up-axis; predicted roll would otherwise drift).
+# ---------------------------------------------------------------------------
+
+
+def encode_action_9d(
+    prev_position: np.ndarray,
+    prev_forward: np.ndarray,
+    prev_up: np.ndarray,
+    next_position: np.ndarray,
+    next_forward: np.ndarray,
+    next_up: np.ndarray,
+) -> np.ndarray:
+    """Encode a pose pair as the 9D action [Δtranslation(3), rot6d(6)].
+
+    `apply_action_9d` inverts this exactly (round-trip ~1e-16 on real trajectories).
+    """
+    rot_prev = camera_rotation_opencv_from_forward_up(prev_forward, prev_up)
+    rot_next = camera_rotation_opencv_from_forward_up(next_forward, next_up)
+    delta_rot = rot_prev.T @ rot_next
+    delta_world = np.asarray(next_position, dtype=np.float64) - np.asarray(
+        prev_position, dtype=np.float64
+    )
+    delta_translation = rot_prev.T @ delta_world
+    return np.concatenate(
+        [delta_translation, rot6d_from_matrix(delta_rot)]
+    ).astype(np.float32)
+
+
+def decode_action_9d(action: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Split a 9D action into (Δtranslation_camera_local, relative rotation 3x3)."""
+    a = np.asarray(action, dtype=np.float32).reshape(-1)
+    if a.shape[0] != ACTION_DIM:
+        raise ValueError(f"expected {ACTION_DIM}-D action, got shape {a.shape}")
+    return a[:3].astype(np.float32), matrix_from_rot6d(a[3:])
+
+
+def apply_action_9d(
+    position: np.ndarray,
+    forward: np.ndarray,
+    up: np.ndarray,
+    action: np.ndarray,
+    upright: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Apply a 9D action to a pose; returns (next_position, next_forward, next_up).
+
+    With `upright=True` (default) the decoded pose is re-projected roll-free — the
+    aim is kept exactly and any bank about it is removed. Pass `upright=False` to
+    see the model's raw output (e.g. to log how much roll it predicts).
+    """
+    delta_translation, delta_rot = decode_action_9d(action)
+    rot_cur = camera_rotation_opencv_from_forward_up(forward, up)
+    next_position = np.asarray(position, dtype=np.float64) + rot_cur @ delta_translation.astype(
+        np.float64
+    )
+    next_forward, next_up = forward_up_from_camera_rotation_opencv(rot_cur @ delta_rot)
+    if upright:
+        next_forward, next_up = project_forward_up_upright(next_forward, next_up)
+    else:
+        next_forward, next_up = orthonormalize_forward_up(next_forward, next_up)
+    return next_position.astype(np.float32), next_forward, next_up
+
+
 __all__ = [
     "ACTION_DIM",
+    "ACTION_DIM_5D",
     "ACTION_SCALE",
     "normalize_action_5d",
     "denormalize_action_5d",
@@ -202,4 +294,7 @@ __all__ = [
     "encode_action_5d",
     "decode_action_5d",
     "apply_action_5d",
+    "encode_action_9d",
+    "decode_action_9d",
+    "apply_action_9d",
 ]
