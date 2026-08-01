@@ -101,17 +101,25 @@ def _ffmpeg_exe() -> str:
     return imageio_ffmpeg.get_ffmpeg_exe()
 
 
-def _encode_mp4(frames: Iterable[Path], out_path: Path, fps: int) -> None:
-    """Concatenate frames into one h264/yuv420p mp4 (the codec the shipped assets use)."""
+def _encode_mp4(
+    frames: Iterable[Path], out_path: Path, fps: int, resize: int | None = None
+) -> None:
+    """Concatenate frames into one h264/yuv420p mp4 (the codec the shipped assets use).
+
+    `resize` writes square `resize x resize` frames. The dataset resizes to `image_size`
+    anyway, so encoding at the training resolution avoids storing (and decoding) the full
+    1024x768 renders — a large saving at hundreds of thousands of frames.
+    `-g 1` makes every frame a keyframe, so seeking to an arbitrary episode is exact.
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     listing = out_path.with_suffix(".txt")
     listing.write_text("".join(f"file '{p.resolve()}'\n" for p in frames))
-    subprocess.run(
-        [_ffmpeg_exe(), "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
-         "-r", str(fps), "-i", str(listing),
-         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "1", str(out_path)],
-        check=True,
-    )
+    cmd = [_ffmpeg_exe(), "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
+           "-r", str(fps), "-i", str(listing)]
+    if resize:
+        cmd += ["-vf", f"scale={resize}:{resize}"]
+    cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "1", str(out_path)]
+    subprocess.run(cmd, check=True)
     listing.unlink()
 
 
@@ -122,6 +130,7 @@ def write_lerobot_dataset(
     fps: int = DEFAULT_FPS,
     robot_type: str = "blender_camera",
     overwrite: bool = False,
+    resize: int | None = 256,
 ) -> Path:
     """Write `episodes` as a LeRobot v3.0 dataset rooted at `out_dir`."""
     import pandas as pd
@@ -152,7 +161,7 @@ def write_lerobot_dataset(
     # one mp4 for the whole shard; episodes are addressed by from_timestamp
     all_frames = [p for ep in episodes for p in ep.frame_paths]
     video_rel = f"videos/{VIDEO_KEY}/chunk-000/file-000.mp4"
-    _encode_mp4(all_frames, out / video_rel, fps)
+    _encode_mp4(all_frames, out / video_rel, fps, resize=resize)
 
     rows, ep_rows = [], []
     global_index = 0

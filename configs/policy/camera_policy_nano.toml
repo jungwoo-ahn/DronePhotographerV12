@@ -1,0 +1,45 @@
+# Run config for the `action_policy_camera_nano` experiment (goal-conditioned camera policy).
+# Env: CAMERA_ROOT, BASE_CHECKPOINT_PATH, WAN_VAE_PATH, IMAGINAIRE_OUTPUT_ROOT.
+# Launch: bash scripts/train_camera_policy.sh
+
+[job]
+task       = "vfm"
+experiment = "action_policy_camera_nano"
+project    = "cosmos3_camera_policy"
+group      = "action_sft"
+name       = "camera_policy_nano_smoke"
+wandb_mode = "disabled"
+
+[model]
+precision = "bfloat16"
+# Our sample is 9 frames at 256x256 (one ego view), far smaller than LIBERO's 17-frame
+# concat_view, so the packing budget can be much lower.
+max_num_tokens_after_packing = 24000
+
+[model.parallelism]
+# Single GPU to start; raise the shard degree with NPROC_PER_NODE for the real run.
+data_parallel_shard_degree     = 1
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+mode           = "selective"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[optimizer]
+lr = 5.0e-05
+
+[scheduler]
+cycle_lengths = [2000]
+warm_up_steps = [100]
+
+[trainer]
+max_iter        = 100     # smoke; override on the command line for a real run
+grad_accum_iter = 1
+logging_iter    = 1
+
+[checkpoint]
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+save_iter = 100
