@@ -5,6 +5,11 @@
 #SBATCH --mem=192G
 #SBATCH --time=08:00:00
 #SBATCH --output=runs/camtrain_%j.out
+# Worker pods are driver-only with NO C compiler, so torch's inductor backend dies with
+# "InvalidCxxCompiler: No working C++ compiler found". Cluster policy's answer is to bring
+# an image that ships one; the venv still supplies python/torch, this is just the toolchain
+# carrier (ubuntu22.04 base => glibc 2.35, which slurmd requires).
+#SBATCH --container=nvcr.io/nvidia/cuda:12.8.0-devel-ubuntu22.04
 # Cosmos3-Nano camera-policy SFT.
 #
 # Single-GPU does NOT fit: with data_parallel_shard_degree=1 FSDP shards nothing, so the

@@ -45,4 +45,8 @@ logging_iter    = 1
 
 [checkpoint]
 load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+# Cosmos NEVER prunes checkpoints -- every save is kept. The params-only base DCP is
+# already 30 GB and a training checkpoint also carries optimizer state and EMA, so a
+# 20k-iter run at save_iter=100 would write ~200 of them. Keep this coarse and raise
+# max_iter instead; 100 only makes sense for the 100-iter smoke (one save, at the end).
 save_iter = 100
