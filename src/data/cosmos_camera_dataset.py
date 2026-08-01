@@ -107,8 +107,16 @@ class CameraPoseLeRobotDataset(ActionBaseDataset):
         return len(self._episode_indices)
 
     def get_shuffle_blocks(self) -> list[tuple[int, int]]:
-        """Contiguous blocks safe to shuffle — one per sample, since episodes don't overlap."""
-        return [(i, i + 1) for i in range(len(self._episode_indices))]
+        """Blocks for `ActionIterableShuffleDataset`, as ``(start, LENGTH)``.
+
+        Not ``(start, end)`` — the consumer does ``range(start, start + length)``,
+        so an end-exclusive pair silently walks off the end of the dataset.
+
+        One block per sample here: each episode is exactly one training window, so
+        there is no within-block sequence to preserve and every sample is free to
+        be shuffled independently.
+        """
+        return [(i, 1) for i in range(len(self._episode_indices))]
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         ep_index = self._episode_indices[idx]
