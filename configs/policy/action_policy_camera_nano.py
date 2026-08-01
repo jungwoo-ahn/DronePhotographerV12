@@ -17,6 +17,7 @@ from hydra.core.config_store import ConfigStore
 
 from cosmos_framework.configs.base.experiment.sft.models.nano_model_config import NANO_MODEL_CONFIG
 from src.data.cosmos_camera_dataset import get_camera_pose_sft_dataset
+from src.train.checkpoint_retention import CheckpointRetention
 from src.train.diagnostics import CameraPolicyDiagnostics
 from cosmos_framework.data.generator.joint_dataloader import (
     PackingDataLoader,
@@ -150,6 +151,10 @@ action_policy_camera_nano = LazyDict(
                 # rotation magnitude, and the goal-sector mix actually reaching
                 # the model through the prompt.
                 camera_policy_diagnostics=L(CameraPolicyDiagnostics)(every_n=50),
+                # Cosmos never deletes a checkpoint and these are >30 GB each.
+                checkpoint_retention=L(CheckpointRetention)(
+                    keep_last=5, keep_best=3, metric_key=None, min_age_s=900.0,
+                ),
             ),
         ),
         checkpoint=dict(
