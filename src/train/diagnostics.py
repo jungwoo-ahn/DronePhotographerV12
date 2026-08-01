@@ -75,13 +75,14 @@ class CameraPolicyDiagnostics(Callback):
         self.every_n = int(every_n)
         self.rotation_sample = int(rotation_sample)
         self._sector_counts: Counter = Counter()
+        self._dumped_keys = False
 
     # ---- helpers ----------------------------------------------------------
     @staticmethod
     def _actions(data_batch: dict[str, Any]) -> np.ndarray | None:
         """The RAW action target, [B, chunk, 9]. `action` is zero-padded to
         max_action_dim by the transform pipeline, so prefer `action_raw`."""
-        for key in ("action_raw", "action"):
+        for key in ("action_raw", "action", "actions", "action_target"):
             value = data_batch.get(key)
             if torch.is_tensor(value) and value.ndim == 3 and value.shape[-1] >= 9:
                 return value[..., :9].detach().float().cpu().numpy()
@@ -102,6 +103,18 @@ class CameraPolicyDiagnostics(Callback):
     ) -> None:
         if self.every_n <= 0 or iteration % self.every_n != 0:
             return
+
+        # The packed batch's schema is not documented, and `action/*` silently went
+        # missing on the first real run because `action_raw` is not where we assumed.
+        # Dump the keys once rather than guess again and burn another run.
+        if not self._dumped_keys:
+            self._dumped_keys = True
+            described = []
+            for key in sorted(data_batch):
+                value = data_batch[key]
+                shape = tuple(value.shape) if torch.is_tensor(value) else type(value).__name__
+                described.append(f"{key}{shape}")
+            print(f"[diagnostics] data_batch keys: {', '.join(described)}", flush=True)
 
         payload: dict[str, float] = {}
         actions = self._actions(data_batch)
