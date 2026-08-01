@@ -8,7 +8,10 @@ experiment = "action_policy_camera_nano"
 project    = "cosmos3_camera_policy"
 group      = "action_sft"
 name       = "camera_policy_nano_smoke"
-wandb_mode = "disabled"
+# offline: every callback's metrics flow (they are gated on `wandb.run`) but nothing
+# is uploaded until you choose to run `wandb sync`. src/train/tb_mirror.py mirrors
+# the same stream into TensorBoard for local viewing.
+wandb_mode = "offline"
 
 [model]
 precision = "bfloat16"

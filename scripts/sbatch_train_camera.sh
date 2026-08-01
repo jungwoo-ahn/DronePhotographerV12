@@ -24,7 +24,10 @@ export NPROC_PER_NODE="$NGPU"
 export PYTORCH_ALLOC_CONF=expandable_segments:True   # optimizer step is the fragmentation peak
 
 echo "GPUs: $NGPU  (sharding optimizer state across all of them)"
+# NOTE the path: the TOML's [model.parallelism] table lands at model.CONFIG.parallelism.*,
+# so a hydra tail override must use that longer path — `model.parallelism.…` raises
+# "Key 'parallelism' is not in struct".
 exec bash scripts/train_camera_policy.sh \
-    model.parallelism.data_parallel_shard_degree="$NGPU" \
-    model.parallelism.data_parallel_replicate_degree=1 \
+    model.config.parallelism.data_parallel_shard_degree="$NGPU" \
+    model.config.parallelism.data_parallel_replicate_degree=1 \
     "$@"

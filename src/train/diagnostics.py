@@ -1,0 +1,178 @@
+"""Task-level training diagnostics for the camera policy.
+
+Cosmos's own 41 metric sites are almost entirely INFRASTRUCTURE — MFU, gradient
+norms, token counts, step timing. They tell you the run is healthy; they cannot
+tell you the policy is learning the right thing. v11 logged only
+``train/<loss>``, ``train/lr`` and a single-sample ``val/action_mse`` — and that
+last one actively misled us: it is dominated by multimodal sampling variance and
+ANTI-correlated with closed-loop performance (a checkpoint with better sampled
+MSE was worse in rollout).
+
+This callback logs what those runs were missing. Everything here is derived from
+the training batch, so it costs no extra forward pass:
+
+  action/*      per-block and per-dimension magnitude of the action target.
+                Translation and rot6d are fed RAW and deliberately unnormalized;
+                if their scales drift apart, rotation — the DOF that aims the
+                camera — is being silently down-weighted in the flow loss. This
+                is the metric that would catch it.
+  action/rotation_deg_*   the relative rotation as a geodesic angle, which is
+                interpretable in a way the six rot6d numbers are not.
+  goal/*        the goal actually reaching the model: bearing distribution and
+                per-sector counts. Given only ~4% of goals are front views, a
+                dataloader change that quietly drops them further would
+                otherwise be invisible.
+  data/*        chunk shape, batch size and prompt length — cheap tripwires for
+                a silently broken export.
+
+Not here yet, and needing a validation pass with sampling: mean-of-K action MSE
+(the fix for v11's noisy single-sample metric), goal-dependence (real vs shuffled
+vs blank prompt — the crux of this project), predicted roll before upright
+projection, and per-sector validation error.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import Counter
+from typing import Any
+
+import numpy as np
+import torch
+
+try:
+    import wandb
+except Exception:  # noqa: BLE001
+    wandb = None  # type: ignore[assignment]
+
+from cosmos_framework.utils.callback import Callback
+
+SECTORS = ("front", "front-right", "right", "back-right",
+           "back", "back-left", "left", "front-left")
+
+
+def _sector(bearing_deg: float) -> str:
+    return SECTORS[int(((bearing_deg + 22.5) % 360.0) // 45.0)]
+
+
+def _geodesic_deg(rot6d: np.ndarray) -> float:
+    """Relative-rotation magnitude in degrees from the 6D encoding."""
+    c0, c1 = rot6d[:3].astype(np.float64), rot6d[3:].astype(np.float64)
+    matrix = np.stack([c0, c1, np.cross(c0, c1)], axis=1)
+    u, _, vt = np.linalg.svd(matrix)
+    if np.linalg.det(u @ vt) < 0:
+        u = u.copy()
+        u[:, -1] *= -1.0
+    trace = float(np.trace(u @ vt))
+    return math.degrees(math.acos(max(-1.0, min(1.0, (trace - 1.0) / 2.0))))
+
+
+class CameraPolicyDiagnostics(Callback):
+    """Logs action-target and goal-distribution statistics every `every_n` steps."""
+
+    def __init__(self, every_n: int = 50, rotation_sample: int = 64) -> None:
+        super().__init__()
+        self.every_n = int(every_n)
+        self.rotation_sample = int(rotation_sample)
+        self._sector_counts: Counter = Counter()
+
+    # ---- helpers ----------------------------------------------------------
+    @staticmethod
+    def _actions(data_batch: dict[str, Any]) -> np.ndarray | None:
+        """The RAW action target, [B, chunk, 9]. `action` is zero-padded to
+        max_action_dim by the transform pipeline, so prefer `action_raw`."""
+        for key in ("action_raw", "action"):
+            value = data_batch.get(key)
+            if torch.is_tensor(value) and value.ndim == 3 and value.shape[-1] >= 9:
+                return value[..., :9].detach().float().cpu().numpy()
+        return None
+
+    def _log(self, payload: dict[str, float], iteration: int) -> None:
+        if wandb is not None and getattr(wandb, "run", None):
+            wandb.log(payload, step=iteration)   # the TB mirror picks this up
+
+    # ---- hooks ------------------------------------------------------------
+    def on_training_step_end(
+        self,
+        model: Any,
+        data_batch: dict[str, Any],
+        output_batch: dict[str, Any],
+        loss: torch.Tensor,
+        iteration: int = 0,
+    ) -> None:
+        if self.every_n <= 0 or iteration % self.every_n != 0:
+            return
+
+        payload: dict[str, float] = {}
+        actions = self._actions(data_batch)
+        if actions is not None:
+            flat = actions.reshape(-1, 9)
+            translation, rot6d = flat[:, :3], flat[:, 3:]
+
+            # Scale balance — the reason the action is fed raw at all.
+            t_std, r_std = float(translation.std()), float(rot6d[:, [1, 2, 3, 5]].std())
+            payload["action/translation_std"] = t_std
+            payload["action/rot6d_offdiag_std"] = r_std
+            payload["action/scale_ratio_t_over_r"] = t_std / r_std if r_std > 1e-9 else float("nan")
+            payload["action/translation_abs_p99"] = float(np.percentile(np.abs(translation), 99))
+
+            for i, name in enumerate(("d_right", "d_up", "d_fwd")):
+                payload[f"action/dim_std/{name}"] = float(translation[:, i].std())
+                payload[f"action/dim_mean/{name}"] = float(translation[:, i].mean())
+            for i in range(6):
+                payload[f"action/rot6d_mean/r{i}"] = float(rot6d[:, i].mean())
+
+            # Interpretable rotation magnitude (subsampled: SVD per row is not free).
+            idx = np.linspace(0, len(rot6d) - 1, min(self.rotation_sample, len(rot6d))).astype(int)
+            angles = np.array([_geodesic_deg(rot6d[i]) for i in idx])
+            payload["action/rotation_deg_mean"] = float(angles.mean())
+            payload["action/rotation_deg_p99"] = float(np.percentile(angles, 99))
+            payload["action/rotation_deg_max"] = float(angles.max())
+
+            payload["data/chunk_len"] = float(actions.shape[1])
+            payload["data/batch_size"] = float(actions.shape[0])
+
+        # Goal reach-through: the prompt is the only channel the goal has.
+        captions = data_batch.get("ai_caption")
+        if isinstance(captions, (list, tuple)) and captions:
+            lengths = [len(str(c)) for c in captions]
+            payload["data/prompt_chars_mean"] = float(np.mean(lengths))
+            payload["data/prompt_blank_frac"] = float(np.mean([l == 0 for l in lengths]))
+            for caption in captions:
+                bearing = self._bearing_from_caption(str(caption))
+                if bearing is not None:
+                    self._sector_counts[_sector(bearing)] += 1
+            total = sum(self._sector_counts.values())
+            if total:
+                for sector in SECTORS:
+                    payload[f"goal/sector_frac/{sector}"] = self._sector_counts[sector] / total
+                front = self._sector_counts["front"] + self._sector_counts["front-left"] \
+                    + self._sector_counts["front-right"]
+                payload["goal/front_family_frac"] = front / total
+
+        if payload:
+            self._log(payload, iteration)
+
+    @staticmethod
+    def _bearing_from_caption(caption: str) -> float | None:
+        """Pull the bearing back out of the prompt we generated.
+
+        The prompt is the only place the goal exists once the sample reaches the
+        model, so reading it back is the honest check that the goal survived the
+        transform pipeline (including any caption dropout).
+        """
+        marker = "bearing "
+        i = caption.find(marker)
+        if i < 0:
+            return None
+        j = i + len(marker)
+        k = j
+        while k < len(caption) and (caption[k].isdigit() or caption[k] in ".-"):
+            k += 1
+        try:
+            return float(caption[j:k])
+        except ValueError:
+            return None
+
+
+__all__ = ["CameraPolicyDiagnostics"]

@@ -19,8 +19,9 @@ SP="$VENV/lib/python3.13/site-packages"
 : "${BASE_CHECKPOINT_PATH:=$CF/examples/checkpoints/Cosmos3-Nano}"
 : "${WAN_VAE_PATH:=$CF/examples/checkpoints/wan22_vae/Wan2.2_VAE.pth}"
 : "${IMAGINAIRE_OUTPUT_ROOT:=$V12/runs/train}"
+: "${COSMOS_TB_DIR:=$IMAGINAIRE_OUTPUT_ROOT/tb}"
 : "${NPROC_PER_NODE:=1}"
-export CAMERA_ROOT BASE_CHECKPOINT_PATH WAN_VAE_PATH IMAGINAIRE_OUTPUT_ROOT
+export CAMERA_ROOT BASE_CHECKPOINT_PATH WAN_VAE_PATH IMAGINAIRE_OUTPUT_ROOT COSMOS_TB_DIR
 export HF_HOME=/home/nas_main/.cache/huggingface
 
 # Vendored-checkout patches (cuda_cudart symlink + experiment registration). Idempotent.
@@ -42,7 +43,8 @@ mkdir -p "$IMAGINAIRE_OUTPUT_ROOT"
 echo "CAMERA_ROOT=$CAMERA_ROOT"
 echo "BASE_CHECKPOINT_PATH=$BASE_CHECKPOINT_PATH"
 echo "SFT_TOML=$SFT_TOML  NPROC_PER_NODE=$NPROC_PER_NODE"
+echo "TensorBoard: tensorboard --logdir $COSMOS_TB_DIR"
 
 cd "$CF"
 exec "$VENV/bin/torchrun" --nproc_per_node="$NPROC_PER_NODE" \
-    -m cosmos_framework.scripts.train --sft-toml "$SFT_TOML" "$@"
+    -m src.train.run_with_tb --sft-toml "$SFT_TOML" "$@"

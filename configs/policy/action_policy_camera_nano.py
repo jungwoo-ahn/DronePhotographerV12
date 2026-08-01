@@ -17,6 +17,7 @@ from hydra.core.config_store import ConfigStore
 
 from cosmos_framework.configs.base.experiment.sft.models.nano_model_config import NANO_MODEL_CONFIG
 from src.data.cosmos_camera_dataset import get_camera_pose_sft_dataset
+from src.train.diagnostics import CameraPolicyDiagnostics
 from cosmos_framework.data.generator.joint_dataloader import (
     PackingDataLoader,
     RankPartitionedDataLoader,
@@ -78,7 +79,7 @@ action_policy_camera_nano = LazyDict(
             project="cosmos3",
             group="action_sft",
             name="action_policy_camera_nano",
-            wandb_mode="disabled",
+            wandb_mode="offline",
         ),
         model=dict(
             config=_action_policy_camera_nano_model_config(),
@@ -144,6 +145,11 @@ action_policy_camera_nano = LazyDict(
                 param_count=dict(save_s3=False),
                 skip_nan_step=dict(max_consecutive_nan=100),
                 training_stats=dict(log_freq=100),
+                # Task-level diagnostics Cosmos does not provide: action scale
+                # balance (translation vs rot6d, both fed raw), interpretable
+                # rotation magnitude, and the goal-sector mix actually reaching
+                # the model through the prompt.
+                camera_policy_diagnostics=L(CameraPolicyDiagnostics)(every_n=50),
             ),
         ),
         checkpoint=dict(
