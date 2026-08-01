@@ -53,15 +53,20 @@ def _as_scalar(value: Any) -> float | None:
     return None
 
 
-def install(log_dir: str | Path | None = None) -> bool:
+def install(log_dir: str | Path | None = None, force: bool = False) -> bool:
     """Wrap ``wandb.log`` so scalars are also written to TensorBoard.
 
-    Returns True if the mirror is active. Safe to call more than once, and safe to
-    call when wandb or tensorboard is unavailable — it degrades to a no-op rather
-    than taking the training run down with it.
+    TIMING MATTERS: before ``wandb.init()``, ``wandb.log`` is a placeholder
+    (``PreInitCallable``) that init REPLACES — so a wrapper installed at process
+    start is silently discarded and nothing is ever mirrored. Install from
+    :class:`TensorBoardMirror`'s ``on_train_start``, which runs after init.
+
+    Returns True if the mirror is active. Safe to call repeatedly, and safe when
+    wandb or tensorboard is missing — it degrades to a no-op rather than taking
+    the training run down with it.
     """
     global _writer, _installed
-    if _installed:
+    if _installed and not force:
         return _writer is not None
 
     _installed = True
@@ -110,4 +115,25 @@ def close() -> None:
         _writer = None
 
 
-__all__ = ["install", "close"]
+from cosmos_framework.utils.callback import Callback  # noqa: E402
+
+
+class TensorBoardMirror(Callback):
+    """Installs the mirror at ``on_train_start`` — i.e. after ``wandb.init()``.
+
+    Deliberately a callback rather than a process-start hook: wandb replaces
+    ``wandb.log`` during init, so anything wrapped earlier is thrown away.
+    """
+
+    def __init__(self, log_dir: str | None = None) -> None:
+        super().__init__()
+        self.log_dir = log_dir
+
+    def on_train_start(self, model: Any = None, iteration: int = 0) -> None:
+        install(self.log_dir, force=True)
+
+    def on_train_end(self, model: Any = None, iteration: int = 0) -> None:
+        close()
+
+
+__all__ = ["install", "close", "TensorBoardMirror"]

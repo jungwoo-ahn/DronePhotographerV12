@@ -19,6 +19,7 @@ from cosmos_framework.configs.base.experiment.sft.models.nano_model_config impor
 from src.data.cosmos_camera_dataset import get_camera_pose_sft_dataset
 from src.train.checkpoint_retention import CheckpointRetention
 from src.train.diagnostics import CameraPolicyDiagnostics
+from src.train.tb_mirror import TensorBoardMirror
 from cosmos_framework.data.generator.joint_dataloader import (
     PackingDataLoader,
     RankPartitionedDataLoader,
@@ -150,6 +151,9 @@ action_policy_camera_nano = LazyDict(
                 # balance (translation vs rot6d, both fed raw), interpretable
                 # rotation magnitude, and the goal-sector mix actually reaching
                 # the model through the prompt.
+                # Must be a callback: wandb.init() replaces wandb.log, so a wrapper
+                # installed at process start is discarded before anything is logged.
+                tensorboard_mirror=L(TensorBoardMirror)(),
                 camera_policy_diagnostics=L(CameraPolicyDiagnostics)(every_n=50),
                 # Cosmos never deletes a checkpoint and these are >30 GB each.
                 checkpoint_retention=L(CheckpointRetention)(
