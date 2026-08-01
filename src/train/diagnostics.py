@@ -80,12 +80,27 @@ class CameraPolicyDiagnostics(Callback):
     # ---- helpers ----------------------------------------------------------
     @staticmethod
     def _actions(data_batch: dict[str, Any]) -> np.ndarray | None:
-        """The RAW action target, [B, chunk, 9]. `action` is zero-padded to
-        max_action_dim by the transform pipeline, so prefer `action_raw`."""
+        """The RAW action target as [-1, 9].
+
+        Prefer `action_raw` over `action`: the transform pipeline zero-pads the
+        latter out to `max_action_dim` (9 -> 64), so its statistics would be
+        dominated by padding.
+
+        Shape-agnostic on purpose. `action_raw` is (chunk, 9) on a single sample
+        and the packer may hand over (B, chunk, 9) or a flat (total, 9) — an
+        earlier version required ndim == 3 and silently logged nothing at all.
+        Anything whose last axis is at least 9 is flattened to rows.
+        """
         for key in ("action_raw", "action", "actions", "action_target"):
             value = data_batch.get(key)
-            if torch.is_tensor(value) and value.ndim == 3 and value.shape[-1] >= 9:
-                return value[..., :9].detach().float().cpu().numpy()
+            if isinstance(value, (list, tuple)) and value and torch.is_tensor(value[0]):
+                try:
+                    value = torch.stack([v.reshape(-1, v.shape[-1]) for v in value])
+                except Exception:  # noqa: BLE001
+                    continue
+            if torch.is_tensor(value) and value.ndim >= 2 and value.shape[-1] >= 9:
+                flat = value.detach().float().cpu().reshape(-1, value.shape[-1])
+                return flat[:, :9].numpy()
         return None
 
     def _log(self, payload: dict[str, float], iteration: int) -> None:
@@ -142,8 +157,9 @@ class CameraPolicyDiagnostics(Callback):
             payload["action/rotation_deg_p99"] = float(np.percentile(angles, 99))
             payload["action/rotation_deg_max"] = float(angles.max())
 
-            payload["data/chunk_len"] = float(actions.shape[1])
-            payload["data/batch_size"] = float(actions.shape[0])
+            # `actions` is flattened to rows, so this counts steps in the batch
+            # rather than assuming a (B, chunk, 9) layout that the packer may not use.
+            payload["data/action_steps_in_batch"] = float(actions.shape[0])
 
         # Goal reach-through: the prompt is the only channel the goal has.
         captions = data_batch.get("ai_caption")
