@@ -67,6 +67,7 @@ class CameraPoseLeRobotDataset(ActionBaseDataset):
         viewpoint: str = "ego_view",
         sample_stride: int = 1,
         video_key: str = VIDEO_KEY,
+        video_backend: str | None = "pyav",
     ) -> None:
         super().__init__(
             root=root,
@@ -82,6 +83,9 @@ class CameraPoseLeRobotDataset(ActionBaseDataset):
         )
         self._image_size = int(image_size)
         self._video_key = video_key
+        # torchcodec is lerobot's default but needs FFmpeg *shared* libs (libavutil.so.*),
+        # which this cluster image doesn't ship; PyAV bundles its own, so decode through it.
+        self._video_backend = video_backend
         # Every episode is exactly chunk_length+1 frames, so episode index == sample index.
         self._episode_indices = sorted(self._episodes)
 
@@ -137,7 +141,8 @@ class CameraPoseLeRobotDataset(ActionBaseDataset):
         path = self._video_path(episode, self._video_key)
         offset = float(episode.get(f"videos/{self._video_key}/from_timestamp", 0.0))
         frames = decode_video_frames(
-            path, [t + offset for t in timestamps], self._tolerance_s
+            path, [t + offset for t in timestamps], self._tolerance_s,
+            backend=self._video_backend,
         )
         if frames.shape[-1] != self._image_size or frames.shape[-2] != self._image_size:
             frames = torch.nn.functional.interpolate(
