@@ -124,13 +124,13 @@ action_policy_camera_nano = LazyDict(
             grad_accum_iter=1,  # real run sets via TOML (GA=2)
             logging_iter=1,
             max_iter=100,  # smoke
-            max_val_iter=None,
-            run_validation=False,
+            max_val_iter=10,          # 10 held-out batches is enough to track the gap
+            run_validation=True,
             run_validation_on_start=False,
             save_zero_checkpoint=False,
             seed=42,
             timeout_period=999999999,
-            validation_iter=100,
+            validation_iter=500,
             compile_config=dict(recompile_limit=8, use_duck_shape=False),
             cudnn=dict(benchmark=True, deterministic=False),
             ddp=dict(broadcast_buffers=True, find_unused_parameters=False, static_graph=True),
@@ -254,7 +254,64 @@ action_policy_camera_nano = LazyDict(
                 ),
             ),
         ),
-        dataloader_val=None,
+        dataloader_val=L(PackingDataLoader)(
+            audio_sample_rate=48000,
+            dataset_name="action_camera_pose_val",
+            max_samples_per_batch=128,  # peak-mem bound (256 OOMs on H200); global = 128 x DP8 x grad_accum2 = 2048
+            max_sequence_length=None,  # None disables token packing (TOML can't express null)
+            patch_spatial=2,
+            sound_latent_fps=0,
+            tokenizer_spatial_compression_factor=16,
+            tokenizer_temporal_compression_factor=4,
+            dataloader=L(RankPartitionedDataLoader)(
+                batch_size=1,
+                in_order=False,
+                num_workers=4,
+                persistent_workers=True,
+                pin_memory=True,
+                prefetch_factor=4,
+                sampler=None,
+                # Shuffling is handled by the dataset (iterable_shuffle=True below):
+                # ActionIterableShuffleDataset streams rank x worker-sharded, episode-order-
+                # shuffled, sequential-within-episode.
+                datasets=dict(
+                    camera=dict(
+                        ratio=1,
+                        dataset=L(get_camera_pose_sft_dataset)(
+                            # LeRobot dir written by src/data/lerobot_export.py — one
+                            # episode per (start, goal) sample.
+                            root="${oc.env:CAMERA_ROOT}",
+                            fps=30,  # metadata only (the loader reads native fps from info.json)
+                            chunk_length=CHUNK_LENGTH,
+                            image_size=256,  # single ego view (no concat_view)
+                            mode="policy",
+                            # RAW actions. rot6d sits at the identity for our small
+                            # per-step rotations (dims 0/4 near 1, std 0.002), so a
+                            # quantile scale is meaningless for it, and scaling
+                            # translation alone to +-1 would bury rotation ~50x in the
+                            # flow loss — the DOF that aims the camera. Cosmos's own
+                            # camera_pose usage is raw too (translation_scale 1.0).
+                            action_normalization=None,
+                            split="val",
+                            iterable_shuffle=False,
+                            episode_shuffle_seed=42,
+                            resolution=None,
+                            max_action_dim="${model.config.max_action_dim}",
+                            # NO classifier-free guidance: blanking the caption teaches the
+                            # policy to act WITHOUT the goal, the opposite of what this
+                            # project measures, and v10/v11 both found guidance 1 optimal.
+                            cfg_dropout_rate=0.0,
+                            format_prompt_as_json=True,
+                            tokenizer_config="${model.config.vlm_config.tokenizer}",
+                            # Idle detection assumes metric translation (eps_t = 5e-3/fps);
+                            # our per-step motion is ~0.08-0.14 m, far above it, so the tag
+                            # would only ever be noise in the prompt.
+                            append_idle_frames=False,
+                        ),
+                    ),
+                ),
+            ),
+        ),
         upload_reproducible_setup=False,
     ),
     flags={"allow_objects": True},

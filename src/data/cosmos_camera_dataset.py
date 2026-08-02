@@ -68,6 +68,8 @@ class CameraPoseLeRobotDataset(ActionBaseDataset):
         sample_stride: int = 1,
         video_key: str = VIDEO_KEY,
         video_backend: str | None = "pyav",
+        split: str = "train",
+        val_ratio: float = 0.05,
     ) -> None:
         super().__init__(
             root=root,
@@ -87,7 +89,22 @@ class CameraPoseLeRobotDataset(ActionBaseDataset):
         # which this cluster image doesn't ship; PyAV bundles its own, so decode through it.
         self._video_backend = video_backend
         # Every episode is exactly chunk_length+1 frames, so episode index == sample index.
-        self._episode_indices = sorted(self._episodes)
+        all_episodes = sorted(self._episodes)
+        # Held-out split. The export writes episodes grouped by placement, so a
+        # contiguous tail is a scene-level holdout rather than a reshuffle of the same
+        # scenes — without it a val loss would mostly measure memorisation of scenes
+        # the model already trains on.
+        if split not in ("train", "val"):
+            raise ValueError(f"split must be 'train' or 'val', got {split!r}")
+        n_val = max(1, int(len(all_episodes) * float(val_ratio))) if val_ratio > 0 else 0
+        self._episode_indices = (
+            all_episodes[: len(all_episodes) - n_val] if split == "train"
+            else all_episodes[len(all_episodes) - n_val:]
+        )
+        if not self._episode_indices:
+            raise ValueError(f"{split} split is empty (episodes={len(all_episodes)}, "
+                             f"val_ratio={val_ratio})")
+        self.split = split
 
     # ---- ActionBaseDataset contract -------------------------------------------------
     @property
@@ -179,6 +196,8 @@ def get_camera_pose_sft_dataset(
     append_duration_fps_timestamps: bool = True,
     append_resolution_info: bool = True,
     append_idle_frames: bool = False,
+    split: str = "train",
+    val_ratio: float = 0.05,
 ):
     """Factory the training config points at (mirrors `get_action_libero_sft_dataset`).
 
@@ -196,6 +215,7 @@ def get_camera_pose_sft_dataset(
     base = CameraPoseLeRobotDataset(
         root=root, fps=fps, chunk_length=chunk_length, image_size=image_size,
         mode=mode, action_normalization=action_normalization,
+        split=split, val_ratio=val_ratio,
     )
     transform = ActionTransformPipeline(
         tokenizer_config=tokenizer_config,
