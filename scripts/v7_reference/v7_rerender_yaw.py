@@ -211,7 +211,13 @@ def render_one_placement(
         age = time.time() - claim.stat().st_mtime
         if age < float(args.claim_stale_s):
             return {"name": name, "status": "claimed_elsewhere"}
-        claim.write_text(f"{os.environ.get('SLURM_JOB_ID', 'local')} (took over stale)\n")
+        try:
+            claim.write_text(f"{os.environ.get('SLURM_JOB_ID', 'local')} (took over stale)\n")
+        except OSError as exc:
+            # Cross-user runs share this output dir (see docs/handoff_rerender.md). A
+            # claim written under a umask that drops group-write cannot be taken over;
+            # skip rather than kill the task, and let its owner's jobs finish it.
+            return {"name": name, "status": f"claim_not_writable ({exc.__class__.__name__})"}
 
     stage1_data = json.loads((stage1_dir / name / "data.json").read_text())
     v6 = load_v6_placement(v6_dir / f"{name}.json",
