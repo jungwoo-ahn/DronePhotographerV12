@@ -19,6 +19,7 @@ from cosmos_framework.configs.base.experiment.sft.models.nano_model_config impor
 from src.data.cosmos_camera_dataset import get_camera_pose_sft_dataset
 from src.train.checkpoint_retention import CheckpointRetention
 from src.train.diagnostics import CameraPolicyDiagnostics
+from src.train.goal_dependence import GoalDependenceProbe
 from src.train.tb_mirror import TensorBoardMirror
 from cosmos_framework.data.generator.joint_dataloader import (
     PackingDataLoader,
@@ -155,6 +156,9 @@ action_policy_camera_nano = LazyDict(
                 # installed at process start is discarded before anything is logged.
                 tensorboard_mirror=L(TensorBoardMirror)(),
                 camera_policy_diagnostics=L(CameraPolicyDiagnostics)(every_n=50),
+                # Is the falling action loss actually driven by the GOAL? Compares
+                # loss(real prompts) with loss(prompts shuffled across the batch).
+                goal_dependence=L(GoalDependenceProbe)(every_n=100),
                 # Cosmos never deletes a checkpoint and these are >30 GB each.
                 checkpoint_retention=L(CheckpointRetention)(
                     keep_last=5, keep_best=3, metric_key=None, min_age_s=900.0,
