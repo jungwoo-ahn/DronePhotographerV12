@@ -67,6 +67,36 @@ def _geodesic_deg(rot6d: np.ndarray) -> float:
     return math.degrees(math.acos(max(-1.0, min(1.0, (trace - 1.0) / 2.0))))
 
 
+def _collect_action_rows(value: Any, _depth: int = 0) -> np.ndarray | None:
+    """Every (…, >=9) tensor/array reachable from `value`, flattened to [-1, 9].
+
+    The packed batch nests differently depending on how the packer groups samples —
+    `action_raw` has been seen as a plain tensor and as a list — and two earlier
+    attempts to pin the layout down each cost a training run before anyone noticed
+    the metrics were missing. So recurse instead of predicting: descend lists,
+    tuples and dicts, take anything whose last axis can hold a 9-D action, and
+    concatenate.
+    """
+    if _depth > 3 or value is None:
+        return None
+    if torch.is_tensor(value):
+        if value.ndim >= 2 and value.shape[-1] >= 9:
+            flat = value.detach().float().cpu().reshape(-1, value.shape[-1])
+            return flat[:, :9].numpy()
+        return None
+    if isinstance(value, np.ndarray):
+        if value.ndim >= 2 and value.shape[-1] >= 9:
+            return value.reshape(-1, value.shape[-1])[:, :9].astype(np.float32)
+        return None
+    if isinstance(value, dict):
+        value = list(value.values())
+    if isinstance(value, (list, tuple)):
+        parts = [p for p in (_collect_action_rows(v, _depth + 1) for v in value) if p is not None]
+        if parts:
+            return np.concatenate(parts, axis=0)
+    return None
+
+
 class CameraPolicyDiagnostics(Callback):
     """Logs action-target and goal-distribution statistics every `every_n` steps."""
 
@@ -92,15 +122,9 @@ class CameraPolicyDiagnostics(Callback):
         Anything whose last axis is at least 9 is flattened to rows.
         """
         for key in ("action_raw", "action", "actions", "action_target"):
-            value = data_batch.get(key)
-            if isinstance(value, (list, tuple)) and value and torch.is_tensor(value[0]):
-                try:
-                    value = torch.stack([v.reshape(-1, v.shape[-1]) for v in value])
-                except Exception:  # noqa: BLE001
-                    continue
-            if torch.is_tensor(value) and value.ndim >= 2 and value.shape[-1] >= 9:
-                flat = value.detach().float().cpu().reshape(-1, value.shape[-1])
-                return flat[:, :9].numpy()
+            rows = _collect_action_rows(data_batch.get(key))
+            if rows is not None:
+                return rows
         return None
 
     def _log(self, payload: dict[str, float], iteration: int) -> None:
