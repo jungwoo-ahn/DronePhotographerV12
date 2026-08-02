@@ -35,7 +35,11 @@ vae_path = "${oc.env:WAN_VAE_PATH}"
 lr = 5.0e-05
 
 [scheduler]
-cycle_lengths = [2000]
+# MUST cover trainer.max_iter. LambdaLinear walks off the end of this list when the
+# cycle completes and indexes it with None, which kills the run with
+# "ListConfig indices must be integers or slices, not NoneType" -- it took out a run
+# at exactly iteration 2000 with cycle_lengths = [2000].
+cycle_lengths = [20000]
 warm_up_steps = [100]
 
 [trainer]
