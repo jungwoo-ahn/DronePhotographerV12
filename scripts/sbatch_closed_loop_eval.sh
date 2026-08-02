@@ -31,6 +31,12 @@ export LD_LIBRARY_PATH="$SHARED/blender/syslibs/lib:$LD_LIBRARY_PATH"
 export PYTHONPATH="$V12:$CF:${PYTHONPATH:-}"
 export HF_HOME=/home/nas_main/.cache/huggingface
 export WAN_VAE_PATH="$CF/examples/checkpoints/wan22_vae/Wan2.2_VAE.pth"
+# The recipe interpolates ${oc.env:CAMERA_ROOT} when the config is built. Inference
+# never reads the dataset, but the interpolation still has to resolve or the config
+# raises before the model is even constructed.
+export CAMERA_ROOT="${CAMERA_ROOT:-$V12/runs/lerobot_v1}"
+export IMAGINAIRE_OUTPUT_ROOT="${IMAGINAIRE_OUTPUT_ROOT:-$V12/runs/train}"
+export BASE_CHECKPOINT_PATH="${BASE_CHECKPOINT_PATH:-$CF/examples/checkpoints/Cosmos3-Nano}"
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 
 exec "$CF/.venv/bin/python" scripts/closed_loop_eval.py "$@"
