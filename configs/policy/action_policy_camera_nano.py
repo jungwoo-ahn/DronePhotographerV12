@@ -124,8 +124,13 @@ action_policy_camera_nano = LazyDict(
             grad_accum_iter=1,  # real run sets via TOML (GA=2)
             logging_iter=1,
             max_iter=100,  # smoke
-            max_val_iter=10,          # 10 held-out batches is enough to track the gap
-            run_validation=True,
+            # OmniMoTModel.validation_step is a bare `pass` returning None, so the
+            # trainer's validate() dies with "cannot unpack non-iterable NoneType".
+            # That is why every shipped recipe leaves this off. Held-out loss is
+            # measured by src/train/heldout_loss.py instead, which goes through
+            # training_step under no_grad.
+            max_val_iter=None,
+            run_validation=False,
             run_validation_on_start=False,
             save_zero_checkpoint=False,
             seed=42,

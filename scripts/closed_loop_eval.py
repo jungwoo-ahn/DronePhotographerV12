@@ -44,7 +44,12 @@ from pathlib import Path
 V12 = "/home/nas_main/jungwooahn/projects/DronePhotographerV12"
 SHARED = "/home/nas_main/jungwooahn/projects/DronePhotographer"
 sys.path.insert(0, V12)
-os.chdir(V12)
+# Run from the framework root: it resolves several assets by RELATIVE path
+# (e.g. model/generator/reasoner/qwen3_vl/configs/Qwen3-VL-8B-Instruct.json), so
+# chdir-ing anywhere else makes model construction fail with FileNotFoundError.
+CF_ROOT = f"{V12}/repos/cosmos-framework"
+sys.path.insert(0, CF_ROOT)
+os.chdir(CF_ROOT)
 
 import numpy as np
 
@@ -60,8 +65,8 @@ ap.add_argument("--guidance", type=float, default=1.0,
                      "never seen an empty caption and a CFG uncond branch would be noise.")
 ap.add_argument("--image-size", type=int, default=256)
 ap.add_argument("--fps", type=int, default=30)
-ap.add_argument("--root", default="data/trajectories")
-ap.add_argument("--out", default="runs/closed_loop/eval.json")
+ap.add_argument("--root", default=f"{V12}/data/trajectories")
+ap.add_argument("--out", default=f"{V12}/runs/closed_loop/eval.json")
 ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--no-ema", action="store_true", help="load raw weights instead of EMA")
 args = ap.parse_args()
