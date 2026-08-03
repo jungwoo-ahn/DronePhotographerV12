@@ -89,7 +89,6 @@ from cosmos_framework.scripts.action_policy_server_utils import (  # noqa: E402
     maybe_init_distributed,
 )
 
-from src.common.action_repr import apply_action_9d  # noqa: E402
 from src.common.annotations import iter_goal_start_windows  # noqa: E402
 from src.common.blender_env import BlenderRolloutEnv, SubprocessBlenderRenderer  # noqa: E402
 from src.common.dataset_base import DEFAULT_EXCLUDE_OBJECTS, _window_object  # noqa: E402
@@ -279,6 +278,9 @@ def main() -> int:
             for c in range(args.chunks):
                 frame = np.asarray(obs["image"])
                 chunk = predict_chunk(model, frame, prompt, seed=args.seed + i)
+                # BlenderRolloutEnv.step applies the 9D action via apply_action_9d,
+                # which decodes rot6d and re-projects the pose upright — the same
+                # decode the training data was encoded with.
                 for step in chunk:
                     obs, _ = env.step(step, render=False)
                 obs = env.reset(env.position, env.forward, env.up)   # render the new view
