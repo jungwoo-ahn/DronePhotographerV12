@@ -187,6 +187,43 @@ def geometry_distance(position, forward, up, goal_view, intr) -> float:
     return float(_geometry_distance(achieved, goal))
 
 
+def write_run_info(placement: str, data_path: str, out_dir: Path) -> str:
+    """Translate a v7 `data.json` into the run_info the pose renderer expects.
+
+    `BlenderDrone.from_run_info` wants `input_scene` / `input_object` /
+    `options.object_position` / `scene_scale` / `rotation_xyz_rad` / `scale`; v7 stores
+    `scene_file` / `object_file` / `subject_foot` and keeps the placement transform in
+    the v6 placement JSON. Reading the transform back from v6 is what makes the rollout
+    scene identical to the one the training frames were rendered in — defaulting it
+    would silently place the subject somewhere else and every distance would be wrong.
+    """
+    data = json.loads(Path(data_path).read_text())
+    v6_path = Path(SHARED) / "data/vlm_object_placing_v6_260428_061326" / f"{placement}.json"
+    scene_scale, scale, rotation = 1.0, 1.0, [0.0, 0.0, 0.0]
+    position = data.get("subject_foot", [0.0, 0.0, 0.0])
+    if v6_path.exists():
+        v6 = json.loads(v6_path.read_text())
+        chosen = v6.get("placements", [{}])[int(data.get("placement_idx", 0))]
+        scene_scale = float(v6.get("scene_scale", 1.0))
+        scale = float(chosen.get("scale", 1.0))
+        rotation = [float(v) for v in chosen.get("rotation", [0.0, 0.0, 0.0])]
+        position = [float(v) for v in chosen.get("position", position)]
+
+    run_info = {
+        "input_scene": str(Path(SHARED) / data["scene_file"]),
+        "input_object": str(Path(SHARED) / data["object_file"]),
+        "scene_scale": scene_scale,
+        "scale": scale,
+        "rotation_xyz_rad": rotation,
+        "options": {"object_position": position,
+                    "resolution": [args.image_size, args.image_size]},
+    }
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{placement}.run_info.json"
+    path.write_text(json.dumps(run_info, indent=1))
+    return str(path)
+
+
 def pick_episodes() -> list:
     """Held-out (start, goal) pairs, one per placement for scene diversity."""
     dirs = sorted(d for d in os.listdir(args.root) if os.path.isdir(os.path.join(args.root, d)))
@@ -231,7 +268,8 @@ def main() -> int:
     for i, (name, path, window, goal_vec) in enumerate(episodes):
         try:
             renderer = SubprocessBlenderRenderer(repo_root=SHARED)
-            env = BlenderRolloutEnv(run_info_path=path, renderer=renderer,
+            run_info = write_run_info(name, path, Path(args.out).parent / "_run_info")
+            env = BlenderRolloutEnv(run_info_path=run_info, renderer=renderer,
                                     object_position=window.start.object_position)
             start = window.start
             obs = env.reset(start.camera_position, start.camera_forward, start.camera_up)
