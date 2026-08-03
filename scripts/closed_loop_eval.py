@@ -56,8 +56,18 @@ import numpy as np
 ap = argparse.ArgumentParser()
 ap.add_argument("--checkpoint", required=True)
 ap.add_argument("--episodes", type=int, default=24)
-ap.add_argument("--chunks", type=int, default=1,
-                help="action chunks executed per episode (each chunk is 8 steps)")
+ap.add_argument("--chunks", type=int, default=0,
+                help="action chunks per episode. 0 = ADAPTIVE: ceil(delta / chunk_size), i.e. "
+                     "however many chunks the goal is actually away. A fixed 1 would leave "
+                     "far goals unreachable by construction and score them as failures.")
+ap.add_argument("--extra-chunks", type=int, default=0,
+                help="chunks to run BEYOND the adaptive count, to see whether the policy "
+                     "settles at the goal or drifts past it")
+ap.add_argument("--sector", default="",
+                help="only evaluate goals in this view sector (e.g. back, front). The data is "
+                     "~69%% back-facing, so 'back' is where the policy has actually been trained.")
+ap.add_argument("--save-frames", action="store_true", default=True,
+                help="save the observation at each chunk boundary for the report")
 ap.add_argument("--chunk-size", type=int, default=8)
 ap.add_argument("--num-steps", type=int, default=30, help="flow-matching steps")
 ap.add_argument("--guidance", type=float, default=1.0,
@@ -92,7 +102,10 @@ from cosmos_framework.scripts.action_policy_server_utils import (  # noqa: E402
 from src.common.annotations import iter_goal_start_windows  # noqa: E402
 from src.common.blender_env import BlenderRolloutEnv, SubprocessBlenderRenderer  # noqa: E402
 from src.common.dataset_base import DEFAULT_EXCLUDE_OBJECTS, _window_object  # noqa: E402
-from src.common.goal_space import DEFAULT_GOAL_KEYS, goal_vector  # noqa: E402
+from src.common.facing import sector3, sector8  # noqa: E402
+from src.common.goal_space import (  # noqa: E402
+    DEFAULT_GOAL_KEYS, SUBJECT_BEARING_KEY, goal_vector,
+)
 from src.common.reward import CameraIntrinsics, pose_to_geometry, _geometry_distance  # noqa: E402
 from src.data.lerobot_export import goal_prompt  # noqa: E402
 
@@ -245,9 +258,14 @@ def pick_episodes() -> list:
             continue
         for w in windows:
             g = goal_vector(w.goal_frame.raw, DEFAULT_GOAL_KEYS, object_key=_window_object(w))
-            if np.isfinite(g).all():
-                picked.append((name, path, w, g))
-                break
+            if not np.isfinite(g).all():
+                continue
+            bearing = float(g[DEFAULT_GOAL_KEYS.index(SUBJECT_BEARING_KEY)])
+            sec = sector8(bearing)
+            if args.sector and args.sector not in (sec, sector3(bearing)):
+                continue
+            picked.append((name, path, w, g, bearing, sec))
+            break
     return picked
 
 
@@ -264,32 +282,66 @@ def main() -> int:
     intr = CameraIntrinsics.from_render(1024, 768)
     results = []
 
-    for i, (name, path, window, goal_vec) in enumerate(episodes):
+    frames_dir = Path(args.out).parent / "frames"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+
+    for i, (name, path, window, goal_vec, bearing, sec) in enumerate(episodes):
         try:
+            delta = abs(window.goal_frame.frame_idx - window.start_frame_idx)
+            # However many chunks the goal actually is away — a fixed count would make
+            # far goals unreachable by construction, then score that as policy failure.
+            n_chunks = args.chunks or int(np.ceil(delta / args.chunk_size))
+            n_chunks += args.extra_chunks
+
             renderer = SubprocessBlenderRenderer(repo_root=SHARED)
             run_info = write_run_info(name, path, Path(args.out).parent / "_run_info")
             env = BlenderRolloutEnv(run_info_path=run_info, renderer=renderer,
                                     object_position=window.start.object_position)
             start = window.start
             obs = env.reset(start.camera_position, start.camera_forward, start.camera_up)
+
             d0 = geometry_distance(env.position, env.forward, env.up, window.goal_frame, intr)
+            trace = [d0]
+            shots = []
+
+            def save(tag: str, image) -> str | None:
+                if not args.save_frames or image is None:
+                    return None
+                from PIL import Image
+                out = frames_dir / f"ep{i:03d}_{tag}.jpg"
+                Image.fromarray(np.asarray(image)).save(out, quality=80)
+                return str(out)
+
+            shots.append({"tag": "start", "path": save("start", obs["image"]), "d": d0})
 
             prompt = make_prompt(goal_vec)
-            for c in range(args.chunks):
+            for c in range(n_chunks):
                 frame = np.asarray(obs["image"])
-                chunk = predict_chunk(model, frame, prompt, seed=args.seed + i)
-                # BlenderRolloutEnv.step applies the 9D action via apply_action_9d,
-                # which decodes rot6d and re-projects the pose upright — the same
-                # decode the training data was encoded with.
+                chunk = predict_chunk(model, frame, prompt, seed=args.seed + i * 100 + c)
+                # BlenderRolloutEnv.step applies the 9D action via apply_action_9d, which
+                # decodes rot6d and re-projects upright — the same decode the training
+                # data was encoded with.
                 for step in chunk:
                     obs, _ = env.step(step, render=False)
                 obs = env.reset(env.position, env.forward, env.up)   # render the new view
+                d = geometry_distance(env.position, env.forward, env.up, window.goal_frame, intr)
+                trace.append(d)
+                shots.append({"tag": f"chunk{c+1}", "path": save(f"chunk{c+1}", obs["image"]), "d": d})
 
-            d1 = geometry_distance(env.position, env.forward, env.up, window.goal_frame, intr)
-            results.append({"placement": name, "d_start": d0, "d_end": d1,
-                            "improvement": d0 - d1})
-            print(f"[eval] {i+1}/{len(episodes)} {name[:44]:44s} "
-                  f"d {d0:.4f} -> {d1:.4f}  improvement {d0-d1:+.4f}", flush=True)
+            d1 = trace[-1]
+            d_best = float(min(trace))
+            results.append({
+                "placement": name, "object": _window_object(window),
+                "sector": sec, "bearing": bearing, "delta": delta, "chunks": n_chunks,
+                "d_start": d0, "d_end": d1, "d_best": d_best,
+                "improvement": d0 - d1, "best_improvement": d0 - d_best,
+                "trace": trace, "shots": shots,
+                "goal_frame_image": window.goal_frame.image,
+                "start_frame_image": start.image,
+            })
+            print(f"[eval] {i+1}/{len(episodes)} {sec:11s} delta={delta:2d} x{n_chunks} "
+                  f"{name[:34]:34s} d {d0:.4f} -> {d1:.4f} (best {d_best:.4f}) "
+                  f"imp {d0-d1:+.4f}", flush=True)
         except Exception as exc:  # noqa: BLE001
             print(f"[eval] {i+1} FAILED {name[:40]}: {type(exc).__name__}: {exc}", flush=True)
 
@@ -297,7 +349,15 @@ def main() -> int:
         print("[eval] every episode failed", flush=True)
         return 1
     imp = np.array([r["improvement"] for r in results])
+    best = np.array([r["best_improvement"] for r in results])
+    by_sector = {}
+    for r in results:
+        by_sector.setdefault(r["sector"], []).append(r["improvement"])
     summary = {
+        "by_sector": {k: {"n": len(v), "mean_improvement": float(np.mean(v))}
+                      for k, v in sorted(by_sector.items())},
+        "mean_best_improvement": float(best.mean()),
+        "frac_best_positive": float((best > 0).mean()),
         "checkpoint": args.checkpoint,
         "episodes": len(results),
         "mean_improvement_over_noop": float(imp.mean()),
