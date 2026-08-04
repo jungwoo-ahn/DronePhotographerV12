@@ -20,6 +20,7 @@ from src.data.cosmos_camera_dataset import get_camera_pose_sft_dataset
 from src.train.checkpoint_retention import CheckpointRetention
 from src.train.diagnostics import CameraPolicyDiagnostics
 from src.train.goal_dependence import GoalDependenceProbe
+from src.train.heldout_loss import HeldOutLossProbe
 from src.train.tb_mirror import TensorBoardMirror
 from cosmos_framework.data.generator.joint_dataloader import (
     PackingDataLoader,
@@ -164,6 +165,12 @@ action_policy_camera_nano = LazyDict(
                 # Is the falling action loss actually driven by the GOAL? Compares
                 # loss(real prompts) with loss(prompts shuffled across the batch).
                 goal_dependence=L(GoalDependenceProbe)(every_n=100),
+                # Held-out loss. NOT via run_validation — OmniMoTModel.validation_step
+                # is a bare `pass`, so that path yields no number and kills the run.
+                # This calls training_step under no_grad on fixed held-out batches at
+                # fixed noise, plus the same on cached train batches so the gap is a
+                # difference of comparable estimators.
+                heldout_loss=L(HeldOutLossProbe)(every_n=500, num_batches=2),
                 # Cosmos never deletes a checkpoint and these are >30 GB each.
                 checkpoint_retention=L(CheckpointRetention)(
                     keep_last=5, keep_best=3, metric_key=None, min_age_s=900.0,
