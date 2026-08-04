@@ -51,7 +51,10 @@ _RULES: list[tuple[str, tuple[str, str]]] = [
     (r"\bwide shot|wide angle|full shot\b", ("shot_size", "wide shot")),
     (r"\bmedium[- ]wide|medium long\b", ("shot_size", "medium-wide shot")),
     (r"\bmedium close[- ]?up|med close\b", ("shot_size", "medium close-up")),
+    (r"\bheadshot|extreme close[- ]?up\b", ("shot_size", "close-up")),
+    (r"\btight on the (face|head)|just the (face|head)|tight on the subject\b", ("shot_size", "close-up")),
     (r"\bclose[- ]?up|closeup|tight shot\b", ("shot_size", "close-up")),
+    (r"\bportrait\b", ("shot_size", "medium close-up")),
     (r"\bmedium shot|waist shot\b", ("shot_size", "medium shot")),
     # elevation
     (r"\bhigh[- ]angle|from above|looking down|bird'?s?[- ]eye|overhead\b", ("elevation", "high angle")),
@@ -62,12 +65,14 @@ _RULES: list[tuple[str, tuple[str, str]]] = [
     (r"\bfront[- ]left\b", ("bearing", "front-left")),
     (r"\bback[- ]right|rear right\b", ("bearing", "back-right")),
     (r"\bback[- ]left|rear left\b", ("bearing", "back-left")),
-    (r"\bfrom behind|from the back|rear view|back of\b", ("bearing", "back")),
+    (r"\bfrom behind|from the back|rear view|back view|back of|behind them\b", ("bearing", "back")),
     (r"\bprofile|from the side|side view|side[- ]on\b", ("bearing", "side")),
     (r"\bfrom the right\b", ("bearing", "right")),
     (r"\bfrom the left\b", ("bearing", "left")),
     (r"\bfrom the front|facing (the )?camera|head[- ]on|front view\b", ("bearing", "front")),
     # placement x
+    (r"\b(upper|lower|top|bottom)[- ]?left\b", ("placement_x", "left third")),      # compound e.g. "lower left"
+    (r"\b(upper|lower|top|bottom)[- ]?right\b", ("placement_x", "right third")),
     (r"\b(on the |to the )?left third|left side|on the left\b", ("placement_x", "left third")),
     (r"\b(on the |to the )?right third|right side|on the right\b", ("placement_x", "right third")),
     (r"\bcenter(ed)?|middle of (the )?frame|centred\b", ("placement_x", "centered")),
@@ -92,17 +97,39 @@ def keyword_classifier(text: str) -> dict[str, str]:
     return cats
 
 
+def hybrid_classifier(text: str, llm: Classifier) -> dict[str, str]:
+    """Deterministic keyword rules (precise on standard cinematography terms) take precedence; the LLM
+    fills only the axes the rules left unset (robust to unusual phrasing). Best of both."""
+    kw = keyword_classifier(text)
+    ll = validate_categories(llm(text))
+    return {**ll, **kw}
+
+
 # --------------------------------------------------------------------------- #
 # LLM classifier (transformers instruct model) — the deployment path
 # --------------------------------------------------------------------------- #
+_FEWSHOT = (
+    'Request: "medium shot at eye level, facing the camera, centered"\n'
+    'JSON: {"shot_size":"medium shot","body_framing":null,"elevation":"eye level",'
+    '"bearing":"front","placement_x":"centered","placement_y":null}\n'
+    'Request: "shoot them from above, three-quarter front-right, full body"\n'
+    'JSON: {"shot_size":null,"body_framing":"full body in frame","elevation":"high angle",'
+    '"bearing":"front-right","placement_x":null,"placement_y":null}\n'
+    'Request: "an intimate portrait, tight on the face"\n'
+    'JSON: {"shot_size":"close-up","body_framing":"tightly cropped","elevation":null,'
+    '"bearing":null,"placement_x":null,"placement_y":null}\n'
+)
+
+
 def _prompt(text: str) -> str:
     axes = "\n".join(f'  "{ax}": one of {list(labels)} or null' for ax, labels in ALLOWED.items())
     return (
-        "You convert a photographer's request into a fixed cinematography schema. "
-        "Return ONLY a JSON object with these keys; use null for any attribute the request does not "
-        "clearly state (do NOT guess). Use ONLY the listed labels. Bearing is the camera's view of the "
-        "SUBJECT (front = we see their face, back = we see their back, side/left/right = a profile).\n"
-        f"{{\n{axes}\n}}\n\nRequest: {text!r}\nJSON:"
+        "You convert a photographer's request into a fixed cinematography schema. Return ONLY a JSON "
+        "object with EXACTLY these keys. Set a key to null unless the request EXPLICITLY states it — "
+        "never guess or add attributes that were not mentioned. Use ONLY the listed labels verbatim. "
+        "Bearing is the camera's view of the SUBJECT: front = we see their face, back = their back, "
+        "side/left/right = a profile.\n"
+        f"Schema:\n{{\n{axes}\n}}\n\n{_FEWSHOT}Request: {text!r}\nJSON:"
     )
 
 
