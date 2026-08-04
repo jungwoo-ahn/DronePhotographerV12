@@ -1,0 +1,10 @@
+# Light CPU/GPU analysis + goal-authoring env (the `.venv-analysis` used by scripts/).
+# The Cosmos 3 training/inference env is separate (CUDA13 / transformers / uv) — see docs.
+numpy
+pillow
+opencv-python-headless==4.10.0.84   # 4.x: has FaceDetectorYN + imread; ultralytics-compatible
+ultralytics                          # YOLO-pose (Module 2 person bbox + keypoints)
+scikit-learn                         # bearing regressor
+joblib
+pyyaml
+pytest
