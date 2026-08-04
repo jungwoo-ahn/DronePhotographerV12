@@ -29,6 +29,14 @@ def test_geometric_keys_offcenter():
     assert g["object_center_x"] == 150 and g["object_center_y"] == 150
 
 
+def test_visible_bbox_convention_for_cutoff_subject():
+    # a subject whose legs extend below the frame (y2=1200 > H=768): object_center/offset must come
+    # from the VISIBLE (clipped) box, not the full box — so a reference image and a training goal agree.
+    g = geometric_keys((400, 200, 600, 1200), W, H)
+    assert g["object_center_y"] == (200 + 768) // 2      # visible centre 484, NOT full centre 700
+    assert g["bbox_y_offset"] == (768 - 200) // 2         # visible half-height, NOT full
+
+
 def test_body_in_frame_estimate():
     kp_full = np.zeros((17, 3)); kp_full[15, 2] = kp_full[16, 2] = 0.9   # ankles visible
     assert estimate_body_in_frame((300, 50, 700, 700), kp_full, H) == 100.0   # inside, ankles seen

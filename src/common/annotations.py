@@ -125,6 +125,25 @@ def _recover_clamped_goal(raw: dict) -> None:
     raw.update(fixed)
 
 
+def _apply_visible_geometry(raw: dict, width: int, height: int) -> None:
+    """Re-derive object_center / bbox_offset under the VISIBLE-bbox convention (no re-render).
+
+    The v7 stage-3 scorer baked object_center / bbox_offset from the FULL projected bbox; for a
+    subject cut off by the frame edge that center sits off-screen. `compute_v5_scores` now reads
+    those from the frame-CLIPPED bbox, so recomputing from the stored `bbox_xyxy_full` here aligns
+    the training goal with what Module 2 reads off a reference image (only the visible box exists
+    there). Occupancy / body_in_frame / az / el are left as stored."""
+    bbox = raw.get("bbox_xyxy_full")
+    if not bbox:
+        return
+    fixed = compute_v5_scores(int(width or RENDER_WIDTH), int(height or RENDER_HEIGHT),
+                              [float(v) for v in bbox],
+                              float(raw.get("cam_to_obj_azimuth_deg") or 0.0),
+                              float(raw.get("cam_to_obj_elevation_deg") or 0.0))
+    for k in ("object_center_x", "object_center_y", "bbox_x_offset", "bbox_y_offset"):
+        raw[k] = fixed[k]
+
+
 def _frame_to_view(
     doc: dict,
     annotation_path: Path,
@@ -155,6 +174,7 @@ def _frame_to_view(
         raw["in_frame"] = render_record.get("in_frame")
         raw["occupancy_clipped"] = render_record.get("occupancy_clipped")
         _recover_clamped_goal(raw)
+        _apply_visible_geometry(raw, doc.get("render_width"), doc.get("render_height"))
 
     return ViewRecord(
         annotation_path=annotation_path,

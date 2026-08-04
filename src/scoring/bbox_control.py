@@ -206,10 +206,15 @@ def compute_v5_scores(
         y_offset = int(round(clipped_h * 0.5))
         denom = min(bbox_full_w, 4.0 * img_w) * min(bbox_full_h, 4.0 * img_h)
     else:
-        cx = (x1f + x2f) * 0.5
-        cy = (y1f + y2f) * 0.5
-        x_offset = int(round(bbox_full_w * 0.5))
-        y_offset = int(round(bbox_full_h * 0.5))
+        # VISIBLE-bbox convention: object_center / bbox_offset describe what is actually IN FRAME
+        # (the frame-clipped bbox), so a hindsight-relabeled training goal and a goal read from a
+        # reference image (where only the visible subject box exists) describe the same composition.
+        # Only body_in_frame's denominator still uses the full projected area (it measures how much of
+        # the subject is cut off — inherently a clipped/full ratio).
+        cx = (cx1 + cx2) * 0.5
+        cy = (cy1 + cy2) * 0.5
+        x_offset = int(round(clipped_w * 0.5))
+        y_offset = int(round(clipped_h * 0.5))
         denom = full_area
 
     occupancy_pct = max(0, min(100, int(round(100.0 * clipped_area / img_area))))
