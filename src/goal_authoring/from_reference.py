@@ -2,22 +2,28 @@
 
 The geometric framing keys are EXACT — a detected person bbox fed through the SAME shot-profile
 computation used in training (`compute_v5_scores`): occupancy, subject placement, bbox offsets. The
-subject-relative bearing comes from body-pose keypoints via the trained classifier (`pose_bearing`,
-~87%/72% sector3/8). Camera elevation is NOT reliably recoverable from a single image (benchmarked at
-chance) so it is left UNSPECIFIED — the user can add it in words. One YOLO-pose model supplies both
-the person box and the keypoints.
+semantic keys come from the SAME body-pose keypoints (one YOLO-pose model supplies box + keypoints):
+subject bearing via a fitted regressor (~85-91% front/side/back, MAE ~18deg) and camera elevation via
+a second regressor (MAE ~8deg vs 13.7 for predict-median). Both beat a VLM by a wide margin — the VLM
+was at chance on elevation and 68%/32% on bearing.
+
+Caveat on elevation: the v7 data is 68% high-angle / 3.5% low-angle, so low-angle references are
+extrapolation; treat the estimate as a prior the user can override in words.
 """
 from __future__ import annotations
+
+import os
 
 import numpy as np
 
 from src.common.goal_space import SUBJECT_BEARING_KEY
 from src.goal_authoring.goal_profile import GoalProfile
-from src.goal_authoring.pose_bearing import BearingModel, pose_features
+from src.goal_authoring.pose_bearing import BearingModel, ElevationModel, elev_features, pose_features
 from src.scoring.bbox_control import compute_v5_scores
 
 DEFAULT_POSE_MODEL = "yolo11l-pose.pt"
 DEFAULT_BEARING_MODEL = "assets/models/bearing_pose_rf.joblib"
+DEFAULT_ELEVATION_MODEL = "assets/models/elevation_pose_rf.joblib"
 
 # keys the detected 2D bbox pins exactly (same computation as the training profile)
 GEOM_KEYS = ("occupancy", "object_center_x", "object_center_y", "bbox_x_offset", "bbox_y_offset")
@@ -48,9 +54,13 @@ def estimate_body_in_frame(bbox, kp, image_h: int) -> float | None:
 
 
 def profile_from_detection(bbox, kp, image_w: int, image_h: int, bearing: BearingModel | None,
+                           elevation: "ElevationModel | None" = None,
                            *, bearing_conf_min: float = 0.35) -> GoalProfile:
-    """Assemble a GoalProfile from one detection. `bearing` may be None (bearing then unspecified).
-    Elevation is deliberately never set (not single-image-recoverable)."""
+    """Assemble a GoalProfile from one detection. `bearing`/`elevation` may be None (then unspecified).
+
+    Elevation comes from pose keypoints, NOT a VLM (which was at chance): vertical foreshortening
+    carries camera pitch, CV MAE ~8deg. Caveat: the v7 data it was fitted on is 68% high-angle /
+    3.5% low-angle, so low-angle references are extrapolation."""
     vals = geometric_keys(bbox, image_w, image_h)
     spec = set(GEOM_KEYS)
     if bearing is not None and kp is not None:
@@ -58,6 +68,10 @@ def profile_from_detection(bbox, kp, image_w: int, image_h: int, bearing: Bearin
         if conf >= bearing_conf_min:
             vals[SUBJECT_BEARING_KEY] = bdeg
             spec.add(SUBJECT_BEARING_KEY)
+    if elevation is not None and kp is not None:
+        vals["cam_to_obj_elevation_deg"] = elevation.elevation_deg(
+            elev_features(kp, bbox, image_w, image_h))
+        spec.add("cam_to_obj_elevation_deg")
     bif = estimate_body_in_frame(bbox, kp, image_h)
     if bif is not None:
         vals["body_in_frame_ratio"] = bif
@@ -69,7 +83,8 @@ class ReferenceEstimator:
     """reference image -> GoalProfile. Loads YOLO-pose (person box + keypoints) + the bearing model."""
 
     def __init__(self, pose_model: str = DEFAULT_POSE_MODEL,
-                 bearing_model: str = DEFAULT_BEARING_MODEL, device=0):
+                 bearing_model: str = DEFAULT_BEARING_MODEL,
+                 elevation_model: str | None = DEFAULT_ELEVATION_MODEL, device=0):
         import cv2
         if not hasattr(cv2, "imshow"):
             cv2.imshow = lambda *a, **k: None
@@ -77,6 +92,8 @@ class ReferenceEstimator:
         self.yolo = YOLO(pose_model)
         self.device = device
         self.bearing = BearingModel.load(bearing_model)
+        self.elevation = (ElevationModel.load(elevation_model)
+                          if elevation_model and os.path.exists(elevation_model) else None)
 
     def detect_main_subject(self, image):
         """Return (bbox, keypoints, W, H) for the most prominent person, or None."""
@@ -96,4 +113,4 @@ class ReferenceEstimator:
         if det is None:
             return GoalProfile({}, frozenset())            # no subject -> empty goal
         bbox, kp, W, H = det
-        return profile_from_detection(bbox, kp, W, H, self.bearing)
+        return profile_from_detection(bbox, kp, W, H, self.bearing, self.elevation)

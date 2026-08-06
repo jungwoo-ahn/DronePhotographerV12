@@ -110,25 +110,31 @@ def hybrid_classifier(text: str, llm: Classifier) -> dict[str, str]:
 # --------------------------------------------------------------------------- #
 _FEWSHOT = (
     'Request: "medium shot at eye level, facing the camera, centered"\n'
-    'JSON: {"shot_size":"medium shot","body_framing":null,"elevation":"eye level",'
-    '"bearing":"front","placement_x":"centered","placement_y":null}\n'
+    'JSON: {"shot_size":["medium shot","medium shot"],"body_framing":null,'
+    '"elevation":["eye level","at eye level"],"bearing":["front","facing the camera"],'
+    '"placement_x":["centered","centered"],"placement_y":null}\n'
     'Request: "shoot them from above, three-quarter front-right, full body"\n'
-    'JSON: {"shot_size":null,"body_framing":"full body in frame","elevation":"high angle",'
-    '"bearing":"front-right","placement_x":null,"placement_y":null}\n'
+    'JSON: {"shot_size":null,"body_framing":["full body in frame","full body"],'
+    '"elevation":["high angle","from above"],"bearing":["front-right","three-quarter front-right"],'
+    '"placement_x":null,"placement_y":null}\n'
     'Request: "an intimate portrait, tight on the face"\n'
-    'JSON: {"shot_size":"close-up","body_framing":"tightly cropped","elevation":null,'
+    'JSON: {"shot_size":["close-up","tight on the face"],'
+    '"body_framing":["tightly cropped","tight on the face"],"elevation":null,'
     '"bearing":null,"placement_x":null,"placement_y":null}\n'
 )
 
 
 def _prompt(text: str) -> str:
-    axes = "\n".join(f'  "{ax}": one of {list(labels)} or null' for ax, labels in ALLOWED.items())
+    axes = "\n".join(f'  "{ax}": [<one of {list(labels)}>, "<exact words from the request>"] or null'
+                     for ax, labels in ALLOWED.items())
     return (
         "You convert a photographer's request into a fixed cinematography schema. Return ONLY a JSON "
-        "object with EXACTLY these keys. Set a key to null unless the request EXPLICITLY states it — "
-        "never guess or add attributes that were not mentioned. Use ONLY the listed labels verbatim. "
-        "Bearing is the camera's view of the SUBJECT: front = we see their face, back = their back, "
-        "side/left/right = a profile.\n"
+        "object with EXACTLY these keys. For each attribute give BOTH the label AND the exact words "
+        "from the request that state it — the quote is checked against the request, so an attribute "
+        "with no literal supporting words must be null. Set a key to null unless the request "
+        "EXPLICITLY states it; never guess. Use ONLY the listed labels verbatim. Bearing is the "
+        "camera's view of the SUBJECT: front = we see their face, back = their back, side/left/right "
+        "= a profile.\n"
         f"Schema:\n{{\n{axes}\n}}\n\n{_FEWSHOT}Request: {text!r}\nJSON:"
     )
 
@@ -136,7 +142,8 @@ def _prompt(text: str) -> str:
 class LLMClassifier:
     """Classify free text into cinematography categories with a cached instruct model."""
 
-    def __init__(self, model: str = "Qwen/Qwen2.5-VL-7B-Instruct", device: str = "cuda"):
+    def __init__(self, model: str = "Qwen/Qwen2.5-VL-7B-Instruct", device: str = "cuda",
+                 require_evidence: bool = True):
         import torch
         from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 
@@ -152,6 +159,7 @@ class LLMClassifier:
             self.model = AutoModelForCausalLM.from_pretrained(
                 model, torch_dtype=torch.bfloat16, device_map=device).eval()
         self.device = device
+        self.require_evidence = require_evidence
 
     def __call__(self, text: str) -> dict[str, str]:
         import torch
@@ -160,12 +168,21 @@ class LLMClassifier:
         prompt = self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
         inp = self.tok(prompt, return_tensors="pt").to(self.device)
         with torch.no_grad():
-            out = self.model.generate(**inp, max_new_tokens=128, do_sample=False)
+            out = self.model.generate(**inp, max_new_tokens=220, do_sample=False)
         raw = self.tok.decode(out[0, inp.input_ids.shape[1]:], skip_special_tokens=True)
-        return validate_categories(_parse_json_obj(raw))
+        return validate_categories(_parse_json_obj(raw, text if self.require_evidence else None))
 
 
-def _parse_json_obj(raw: str) -> dict[str, str]:
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+
+
+def _parse_json_obj(raw: str, source_text: str | None = None) -> dict[str, str]:
+    """Parse the model's JSON. Values may be a bare label or [label, evidence].
+
+    When `source_text` is given, an attribute is kept only if its EVIDENCE QUOTE actually occurs in
+    the request (grounding check) — this is what suppresses the model asserting attributes the user
+    never stated, the dominant LLM failure mode here (~30% of predicted axes were hallucinated)."""
     m = re.search(r"\{.*\}", raw, re.S)
     if not m:
         return {}
@@ -173,4 +190,24 @@ def _parse_json_obj(raw: str) -> dict[str, str]:
         obj = json.loads(m.group(0))
     except json.JSONDecodeError:
         return {}
-    return {k: v for k, v in obj.items() if isinstance(v, str)}
+    src = _norm(source_text) if source_text is not None else None
+    out: dict[str, str] = {}
+    for k, v in obj.items():
+        label = evidence = None
+        if isinstance(v, str):
+            label = v
+        elif isinstance(v, (list, tuple)) and v and isinstance(v[0], str):
+            label = v[0]
+            evidence = v[1] if len(v) > 1 and isinstance(v[1], str) else None
+        if label is None:
+            continue
+        if src is not None:
+            if not evidence:
+                continue                              # unsupported claim -> drop
+            ev = _norm(evidence)
+            # accept if the quote (or any of its content words) is really in the request
+            words = [w for w in ev.split() if len(w) > 2]
+            if ev not in src and not (words and all(w in src for w in words)):
+                continue
+        out[k] = label
+    return out

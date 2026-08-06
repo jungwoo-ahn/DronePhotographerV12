@@ -21,6 +21,11 @@ POSE_FEATURE_NAMES = (
 )
 POSE_FEATURE_DIM = len(POSE_FEATURE_NAMES)
 
+# Elevation features live here too: the VLM was at chance on camera pitch, but keypoint geometry
+# carries it through VERTICAL FORESHORTENING — as the camera tilts, the head/torso/thigh/shin spans
+# compress at different rates, and apparent head size vs torso length shifts (CV MAE ~8deg).
+ELEV_FEATURE_DIM = 24
+
 
 def pose_features(kp: np.ndarray, box: np.ndarray) -> list[float]:
     """(17,3) COCO keypoints [x,y,conf] + person xyxy box -> orientation feature vector.
@@ -45,6 +50,56 @@ def pose_features(kp: np.ndarray, box: np.ndarray) -> list[float]:
         float(c[5]), float(c[6]), float(c[11]), float(c[12]),
         float(c[1] - c[2]), float(c[3] - c[4]),
     ]
+
+
+def elev_features(kp: np.ndarray, box: np.ndarray, W: int, H: int) -> list[float]:
+    """(17,3) COCO keypoints + person box + frame size -> camera-pitch features.
+    Vertical spans and their RATIOS (the foreshortening signature), apparent head size, and where the
+    body sits in frame. Scale-normalized by body pixel height."""
+    kp = np.asarray(kp, dtype=np.float64)
+    xy, c = kp[:, :2], kp[:, 2]
+    nose, leye, reye = xy[0], xy[1], xy[2]
+    lsh, rsh, lhip, rhip = xy[5], xy[6], xy[11], xy[12]
+    lkn, rkn, lank, rank = xy[13], xy[14], xy[15], xy[16]
+    sh, hip = 0.5 * (lsh + rsh), 0.5 * (lhip + rhip)
+    kn, ank = 0.5 * (lkn + rkn), 0.5 * (lank + rank)
+    bh = max(float(box[3] - box[1]), 1e-6)
+    bw = max(float(box[2] - box[0]), 1e-6)
+
+    def vy(a, b): return float((b[1] - a[1]) / bh)
+
+    torso, thigh, shin, head = vy(sh, hip), vy(hip, kn), vy(kn, ank), vy(nose, sh)
+    seg = (head, torso, thigh, shin)
+    tot = sum(abs(s) for s in seg) + 1e-6
+    eye_sep = float(np.linalg.norm(leye - reye)) / bh
+    sh_w = float(np.linalg.norm(lsh - rsh)) / bh
+    hip_w = float(np.linalg.norm(lhip - rhip)) / bh
+    return [
+        head, torso, thigh, shin,
+        head / tot, torso / tot, thigh / tot, shin / tot,
+        torso / (thigh + shin + 1e-6),
+        eye_sep, sh_w, hip_w, sh_w / (hip_w + 1e-6),
+        eye_sep / (abs(torso) + 1e-6),
+        bh / H, bw / W, bh / (bw + 1e-6),
+        float((box[1] + box[3]) * 0.5 / H), float(box[3] / H), float(box[1] / H),
+        float(c[0]), float(c[15]), float(c[16]), float(np.mean(c[5:13])),
+    ]
+
+
+class ElevationModel:
+    """Fitted regressor over `elev_features` predicting cam_to_obj_elevation_deg (negative = camera
+    above the subject). CV MAE ~8deg vs 13.7deg for predict-median."""
+
+    def __init__(self, reg):
+        self.reg = reg
+
+    def elevation_deg(self, features: list[float]) -> float:
+        return float(self.reg.predict(np.asarray(features, dtype=np.float64).reshape(1, -1))[0])
+
+    @classmethod
+    def load(cls, path: str | Path) -> "ElevationModel":
+        import joblib
+        return cls(joblib.load(path))
 
 
 class BearingModel:
