@@ -149,7 +149,7 @@ def main():
     prof_pool = []  # profiles for module-1 round-trip
     scanned = 0
     for dn in dirs:
-        if len(index) > 600: break
+        if len(index) > 4000: break
         obj = dn.split("__", 1)[1] if "__" in dn else dn
         if front_azimuth(obj) is None: continue
         try: d = json.load(open(os.path.join(ROOT, dn, "data.json")))
@@ -168,7 +168,7 @@ def main():
                 index.append((gt, gt_categories(gt, W, H), obj, os.path.join(ROOT, dn, r["path_rel"]), W, H))
                 prof_pool.append({k: gt[k] for k in ("occupancy", "object_center_x", "object_center_y",
                                                      "cam_to_obj_elevation_deg", SUBJECT_BEARING_KEY)})
-        if scanned > 350: break
+        if scanned > 1200: break
     print(f"index: {len(index)} renders; module-1 round-trip pool: {len(prof_pool)}", flush=True)
 
     # ---- module 1 ----
@@ -179,7 +179,7 @@ def main():
     # ---- module 2: queries (stratified) + metrics + cards ----
     tkeys = ("occupancy", "object_center_x", "object_center_y", SUBJECT_BEARING_KEY)
     # metrics over a large random query sample
-    metric_idx = random.sample(range(len(index)), min(150, len(index)))
+    metric_idx = random.sample(range(len(index)), min(500, len(index)))
     bear_ok = px_ok = py_ok = shot_ok = elev_ok = m = bn = 0
     elev_err = []
     for i in metric_idx:
@@ -204,48 +204,79 @@ def main():
     # cards: round-robin over (shot_size, sector3) cells for diversity, up to 30
     from collections import defaultdict
     from src.goal_authoring.from_reference import profile_from_detection
+    N_CARDS = 84
+    MAX_PER_OBJECT = 2
     cells = defaultdict(list)
     for i in metric_idx:
         gt, gcats, obj, ip, W, H = index[i]
-        cells[(gcats["shot_size"], sector3(gt[SUBJECT_BEARING_KEY]))].append(i)
-    card_ids, rnd = [], 0
-    while len(card_ids) < 30 and any(len(v) > rnd for v in cells.values()):
-        for v in cells.values():
-            if len(v) > rnd:
-                card_ids.append(v[rnd])
-            if len(card_ids) >= 30:
+        cells[(gcats["shot_size"], sector3(gt[SUBJECT_BEARING_KEY]), gcats.get("elevation"))].append(i)
+    for v in cells.values():
+        random.shuffle(v)
+    card_ids, rnd, used_obj, used_scene = [], 0, defaultdict(int), defaultdict(int)
+    order = sorted(cells)                       # deterministic sweep over composition cells
+    while len(card_ids) < N_CARDS and rnd < 40:
+        progressed = False
+        for key in order:
+            v = cells[key]
+            if len(v) <= rnd:
+                continue
+            i = v[rnd]
+            obj = index[i][2]; scene = os.path.basename(os.path.dirname(os.path.dirname(index[i][3])))
+            if used_obj[obj] >= MAX_PER_OBJECT or used_scene[scene] >= 3:
+                continue                        # force scene / subject variety
+            card_ids.append(i); used_obj[obj] += 1; used_scene[scene] += 1; progressed = True
+            if len(card_ids) >= N_CARDS:
                 break
+        if not progressed:
+            break
         rnd += 1
-    m2_cards = []
-    for i in card_ids:
+    print(f"cards: {len(card_ids)} across {len(cells)} composition cells, "
+          f"{len(used_obj)} subjects, {len(used_scene)} scenes", flush=True)
+    def render_card(i):
         gt, gcats, obj, ip, W, H = index[i]
-        det = est.detect_main_subject(ip)            # single YOLO call per card
-        if det is None: continue
+        det = est.detect_main_subject(ip)
+        if det is None: return None, None
         bbox, kp, Wd, Hd = det
-        gp = profile_from_detection(bbox, kp, Wd, Hd, est.bearing)
-        if "occupancy" not in gp.specified: continue
+        gp = profile_from_detection(bbox, kp, Wd, Hd, est.bearing, est.elevation)
+        if "occupancy" not in gp.specified: return None, None
         rc = gp.categories()
-        # recovered vs GT chips with match marks
-        rows = []
+        rows, misses = [], 0
         for ax, glab in gcats.items():
-            rlab = rc.get(ax, "—"); mark = "✓" if rlab == glab else "✗"
-            cls = "ok" if rlab == glab else "no"
-            rows.append(f'<tr><td>{ax}</td><td class="{cls}">{rlab} {mark}</td><td class="gt">{glab}</td></tr>')
+            rlab = rc.get(ax, "—"); hit = rlab == glab
+            misses += (not hit)
+            rows.append(f'<tr><td>{ax}</td><td class="{"ok" if hit else "no"}">{rlab} {"✓" if hit else "✗"}</td>'
+                        f'<td class="gt">{glab}</td></tr>')
         if SUBJECT_BEARING_KEY in gp.specified:
             gb, rb = sector3(gt[SUBJECT_BEARING_KEY]), sector3(gp.values[SUBJECT_BEARING_KEY])
-            mk = "✓" if gb == rb else "✗"; cls = "ok" if gb == rb else "no"
-            rows.append(f'<tr><td>bearing</td><td class="{cls}">{sector8(gp.values[SUBJECT_BEARING_KEY])} {mk}</td><td class="gt">{sector8(gt[SUBJECT_BEARING_KEY])}</td></tr>')
-        # transfer recon: nearest composition from a DIFFERENT subject
+            hit = gb == rb; misses += (not hit)
+            rows.append(f'<tr><td>bearing</td><td class="{"ok" if hit else "no"}">'
+                        f'{sector8(gp.values[SUBJECT_BEARING_KEY])} {"✓" if hit else "✗"}</td>'
+                        f'<td class="gt">{sector8(gt[SUBJECT_BEARING_KEY])}</td></tr>')
         q = {k: gp.values[k] for k in tkeys if k in gp.values}
         best = min((e for e in index if e[2] != obj), key=lambda e: prof_distance(q, e[0], tkeys), default=None)
-        recon_img = f'<img src="data:image/jpeg;base64,{b64(Image.open(best[3]),260)}"><div class="cap">{best[2][:26]}</div>' if best else ""
-        m2_cards.append(f"""<div class="card m2">
-<div class="pair">
-  <div class="col"><div class="lbl">reference (overlay)</div><img src="data:image/jpeg;base64,{b64(overlay(ip, det, gp),260)}"></div>
-  <div class="col"><div class="lbl">recon: same composition, other subject</div>{recon_img}</div>
-</div>
-<div class="prompt">→ {gp.to_nl()}</div>
-<table class="cmp"><tr><th></th><th>recovered</th><th>GT</th></tr>{''.join(rows)}</table></div>""")
+        recon = (f'<img src="data:image/jpeg;base64,{b64(Image.open(best[3]),240)}">'
+                 f'<div class="cap">{best[2][:26]}</div>') if best else ""
+        html = (f'<div class="card m2"><div class="pair">'
+                f'<div class="col"><div class="lbl">reference (overlay)</div>'
+                f'<img src="data:image/jpeg;base64,{b64(overlay(ip, det, gp),240)}"></div>'
+                f'<div class="col"><div class="lbl">recon: same composition, other subject</div>{recon}</div>'
+                f'</div><div class="prompt">→ {gp.to_nl()}</div>'
+                f'<table class="cmp">{"".join(rows)}</table></div>')
+        return html, misses
+
+    m2_cards, card_misses = [], []
+    for i in card_ids:
+        h, mi = render_card(i)
+        if h: m2_cards.append(h); card_misses.append((mi, i))
+
+    # failure gallery: the cards with the most disagreements (honesty — show where it breaks)
+    fail_ids = [i for mi, i in sorted(card_misses, key=lambda t: -t[0]) if mi >= 2][:12]
+    fail_cards = [h for h in (render_card(i)[0] for i in fail_ids) if h]
+    print(f"failure gallery: {len(fail_cards)} cards with >=2 mismatched attributes", flush=True)
+
+    _unused_loop = []
+    for i in []:
+        pass
 
     # ---- assemble HTML ----
     ax_html = " · ".join(f"{a} {v:.0f}%" for a, v in sorted(rt_axes.items()))
@@ -295,6 +326,10 @@ td.ok{{color:#34a853}} td.no{{color:#ea4335}} td.gt{{color:#8ab4f8}}
 <p class="sub"><b>Elevation update:</b> a VLM was at chance on camera height (34–36% vs 33%), so it was originally left unspecified. The same body-pose keypoints that give bearing also encode camera pitch through <i>vertical foreshortening</i> — a regressor on them reaches MAE ≈8° (vs 13.7° for predict-median, corr 0.76), so elevation is now recovered too. Caveat: the source data is 68% high-angle / 3.5% low-angle, so low-angle references are extrapolation — and that same imbalance means a “heroic low angle” goal has almost no training support downstream.</p>
 <p class="sub">Each card: the reference with an overlay of what was extracted · the recovered goal prompt · recovered-vs-GT categories (✓/✗) · a “recon” = the nearest-composition render from a <b>different scene/subject</b> — what this goal transfers to.</p>
 <div class="grid">{''.join(m2_cards)}</div>
+
+<h2>3 · Where it breaks &nbsp;<span class="sub">(cards with ≥2 mismatched attributes)</span></h2>
+<p class="sub">Selected by disagreement, not curated for looks. Most errors are shot-size boundary cases (the detector's silhouette box is tighter than the training mesh AABB, so occupancy lands one band low) and bearing on subjects whose pose is ambiguous from behind.</p>
+<div class="grid">{''.join(fail_cards)}</div>
 """
     os.makedirs("runs", exist_ok=True); open(OUT, "w").write(html)
     print(f"wrote {OUT}  ({os.path.getsize(OUT)//1024} KB, {len(m2_cards)} ref cards)")
