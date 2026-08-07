@@ -84,12 +84,17 @@ class ReferenceEstimator:
 
     def __init__(self, pose_model: str = DEFAULT_POSE_MODEL,
                  bearing_model: str = DEFAULT_BEARING_MODEL,
-                 elevation_model: str | None = DEFAULT_ELEVATION_MODEL, device=0):
+                 elevation_model: str | None = DEFAULT_ELEVATION_MODEL, device=None):
         import cv2
         if not hasattr(cv2, "imshow"):
             cv2.imshow = lambda *a, **k: None
         from ultralytics import YOLO
         self.yolo = YOLO(pose_model)
+        if device is None:
+            # the cluster GPUs are often all taken; falling back keeps goal extraction working
+            # (slower) instead of dying mid-scan with an unhelpful CUDA error
+            import torch
+            device = 0 if torch.cuda.is_available() else "cpu"
         self.device = device
         self.bearing = BearingModel.load(bearing_model)
         self.elevation = (ElevationModel.load(elevation_model)
