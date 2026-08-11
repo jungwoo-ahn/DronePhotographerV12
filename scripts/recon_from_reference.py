@@ -34,6 +34,10 @@ os.chdir(CF_ROOT)
 
 import numpy as np
 
+# Imported up here, ahead of the torch/cosmos block below, purely so the `--root` default
+# can reference it — the rest of the src imports stay after argparse to keep `--help` fast.
+from src.common.dataset_base import DEFAULT_TRAJ_ROOT  # noqa: E402
+
 ap = argparse.ArgumentParser()
 ap.add_argument("--checkpoint", required=True)
 ap.add_argument("--cases", type=int, default=6, help="reference images to re-shoot")
@@ -43,7 +47,7 @@ ap.add_argument("--num-steps", type=int, default=30)
 ap.add_argument("--guidance", type=float, default=1.0)
 ap.add_argument("--image-size", type=int, default=256)
 ap.add_argument("--fps", type=int, default=30)
-ap.add_argument("--root", default=f"{V12}/data/trajectories")
+ap.add_argument("--root", default=f"{V12}/{DEFAULT_TRAJ_ROOT}")
 ap.add_argument("--out", default=f"{V12}/runs/recon_ref/recon.json")
 ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--no-ema", action="store_true")
@@ -106,11 +110,13 @@ def load_policy():
     return pipe.model
 
 
-def make_prompt(goal_vec: np.ndarray) -> str:
+def make_prompt(goal_vec: np.ndarray, specified=None, crop=None) -> str:
     """Exactly the JSON prompt the policy was trained on (see closed_loop_eval.make_prompt)."""
     formatter = ActionPromptJsonFormatter()
     sample = {
-        "ai_caption": goal_prompt(goal_vec),
+        # specified/crop must be threaded through: training prompts carry the crop clause and
+        # omit nothing, so a prompt built without them is a different distribution.
+        "ai_caption": goal_prompt(goal_vec, specified=specified, crop=crop),
         "viewpoint": "ego_view",
         "conditioning_fps": torch.tensor(args.fps, dtype=torch.long),
         "image_size": torch.tensor([args.image_size, args.image_size]),
@@ -165,6 +171,9 @@ def profile_summary(gp) -> dict:
 
 
 def _unused_pick_cases(est, n):
+    """DEAD CODE — `prepare_recon_goals.py` is the live path. Its inline filter
+    (occupancy 30-88, body_in_frame >= 50) predates the visible_frac gate; use
+    `src.common.annotations.is_goal_frame` if this is ever revived."""
     """(reference render, target placement) pairs — the target is a DIFFERENT scene AND subject."""
     root = Path(args.root)
     dirs = [d for d in root.iterdir() if d.is_dir()]
@@ -230,7 +239,7 @@ def main():
     for ci, c in todo:
         # 1) goal already extracted from the reference image by Module 2
         gvec = np.asarray(c["goal_vec"], dtype=np.float32)
-        prompt = make_prompt(gvec)
+        prompt = make_prompt(gvec, specified=c.get("goal_specified"), crop=c.get("goal_crop") or None)
 
         # 2) start in a DIFFERENT scene/subject
         tgt_dir = Path(c["tgt_dir"]); doc = json.loads((tgt_dir / "data.json").read_text())

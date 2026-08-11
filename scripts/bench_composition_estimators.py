@@ -8,8 +8,10 @@ os.chdir("/home/nas_main/jungwooahn/projects/DronePhotographerV12")
 import numpy as np
 from PIL import Image
 
+from src.common.annotations import is_goal_frame
 from src.common.facing import front_azimuth, sector3, sector8
 from src.goal_authoring import vocab
+from src.common.dataset_base import DEFAULT_TRAJ_ROOT
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--n", type=int, default=150)
@@ -18,7 +20,7 @@ ap.add_argument("--model", default="Qwen/Qwen2.5-VL-7B-Instruct")
 ap.add_argument("--full-frame", action="store_true", help="pass the whole frame (keep scene context for elevation)")
 args = ap.parse_args()
 
-ROOT = "data/trajectories"
+ROOT = DEFAULT_TRAJ_ROOT
 
 # ---- sample GT renders (object with a facing entry, subject clearly visible, varied azimuth) ----
 dirs = [d for d in os.listdir(ROOT) if os.path.isdir(os.path.join(ROOT, d))]
@@ -34,7 +36,7 @@ for dn in dirs:
     for pair in d.get("render_records", []):
         for r in pair:
             s = r.get("scores")
-            if not s or not r.get("in_frame") or not (30 <= s["occupancy"] <= 92) or s["body_in_frame_ratio"] < 45:
+            if not is_goal_frame(r):
                 continue
             cand.append((r, s))
     if not cand: continue

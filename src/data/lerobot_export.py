@@ -29,16 +29,20 @@ emits exactly what `pose_abs_to_rel(..., "rot6d", "backward_framewise")` would.
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Collection, Iterable, Mapping, Sequence
 
 import numpy as np
 
 from src.common.action_repr import ACTION_DIM
 from src.common.facing import sector8
+from src.common.goal_space import RENDER_HEIGHT, RENDER_WIDTH
+from src.goal_authoring import vocab
+from src.goal_authoring.vocab import _classify
 from src.common.goal_space import DEFAULT_GOAL_KEYS, SUBJECT_BEARING_KEY
 
 VIDEO_KEY = "observation.images.image"
@@ -48,39 +52,113 @@ DEFAULT_FPS = 30
 PARAPHRASE_SEP = " | "
 
 
-def shot_size(occupancy: float) -> str:
-    for hi, name in ((8, "extreme wide"), (20, "wide"), (38, "medium-wide"),
-                     (58, "medium"), (78, "medium close-up")):
-        if occupancy < hi:
-            return f"{name} shot"
-    return "close-up"
+def crop_phrase(top_cut: float, bot_cut: float) -> str:
+    """Which END of the subject the frame cuts.
+
+    This is the one composition fact no goal key carries: `occupancy` and
+    `body_in_frame_ratio` are area ratios and `object_center_y` is clipped on screen,
+    so "head cropped" and "legs cropped" are indistinguishable in the vector. It comes
+    from the signed bbox instead (`src.common.annotations._apply_crop_extent`).
+    """
+    top, bot = top_cut > 0.02, bot_cut > 0.02
+    if top and bot:
+        return "cropped at both the head and the feet"
+    if top:
+        return "cropped above the head"
+    if bot:
+        return "cropped below the waist" if bot_cut > 0.35 else "cropped at the legs"
+    # Not "the whole subject in frame" — BODY_FRAMING already says that in the preceding
+    # clause, and the two would read as a stutter. They are different quantities (area
+    # ratio vs vertical extent), so the word still has to be here; it just has to differ.
+    return "uncropped"
 
 
-def elevation_word(elevation_deg: float) -> str:
-    if elevation_deg < -25:
-        return "a high angle"
-    if elevation_deg > 10:
-        return "a low angle"
-    return "eye level"
+def goal_prompt(
+    goal_vec: np.ndarray,
+    keys: Sequence[str] = tuple(DEFAULT_GOAL_KEYS),
+    *,
+    crop: Mapping[str, float] | None = None,
+    specified: Collection[str] | None = None,
+) -> str:
+    """The goal as a cinematography instruction: every key, as a word AND as a number.
 
+    The model receives the goal ONLY as this text — the goal vector never reaches it in
+    numeric form — so a key omitted here is a key the policy can neither be asked for nor
+    learn. The previous version serialized 3 of the 8 keys, and the axis probe showed
+    exactly that consequence: `object_center_x` and `object_center_y`, the two absent
+    ones, scored at chance (3/6 correct direction) because the request was never sent.
 
-def goal_prompt(goal_vec: np.ndarray, keys: Sequence[str] = tuple(DEFAULT_GOAL_KEYS)) -> str:
-    """The goal as a cinematography instruction.
+    Each word is paired with its number in the same clause. That pairing is what gives
+    the number meaning: the words vary per sample, so they teach the mapping in a way a
+    constant schema explanation could not — and a constant explanation would also be
+    identical across all samples, carrying no signal for telling goals apart.
 
-    Task framing first (the model must know it is being asked to MOVE THE CAMERA, not to
-    generate a clip — the shipped camera_pose prompts are forward-dynamics descriptions),
-    then the shot in words + the concrete numbers. ~40 tokens, which is the same length as
-    Cosmos's own camera_pose example prompts and ~1% of the 4096-token cap.
+    Category words come from `src.goal_authoring.vocab`, the single source of truth.
+    They used to be hand-copied here and had drifted (elevation cut at -25/+10 vs the
+    vocab's -20/+15, label "medium close-up shot" vs "medium close-up"), so the same
+    goal produced different sentences depending on which path serialized it.
+
+    `crop` is optional because it is not part of the goal vector: it needs the signed
+    bbox from the annotation (`top_cut_frac` / `bot_cut_frac`). Callers that synthesize
+    a goal by perturbing a vector — the axis probe — have no such frame, and simply omit
+    the clause rather than assert something they cannot know.
     """
     v = {k: float(goal_vec[i]) for i, k in enumerate(keys)}
     bearing = v[SUBJECT_BEARING_KEY]
-    return (
-        "Move the camera to achieve this shot: "
-        f"a {shot_size(v['occupancy'])} of the subject from the subject's "
-        f"{sector8(bearing)}, at {elevation_word(v['cam_to_obj_elevation_deg'])}. "
-        f"(bearing {bearing:.0f}°, occupancy {v['occupancy']:.0f}%, "
-        f"elevation {v['cam_to_obj_elevation_deg']:.0f}°)"
-    )
+    occ = v["occupancy"]
+    body = v["body_in_frame_ratio"]
+    elev = v["cam_to_obj_elevation_deg"]
+    cx, cy = v["object_center_x"], v["object_center_y"]
+    ox, oy = v["bbox_x_offset"], v["bbox_y_offset"]
+
+    # `specified=None` means "every key is real" — the training export, where the goal comes
+    # from an actual frame. A goal AUTHORED from language or a reference image constrains only
+    # some axes, and the rest arrive as 0.0 from `gp.values.get(k, 0.0)`. Emitting those would
+    # not be a harmless default: occupancy 0 reads as "extreme wide shot", body_in_frame 0 as
+    # "tightly cropped", centre 0/0 as the top-left corner. The clause is dropped instead.
+    have = (lambda k: True) if specified is None else (lambda k: k in specified)
+
+    # The first two clauses are joined by a SPACE, the rest by ", " — "a wide shot of the
+    # subject from the subject's back, at eye level, ...". Joining all of them with ", "
+    # changes every training prompt (checked: 0/306 rebuilt prompts matched the exported set).
+    head = (f"a {_classify(occ, vocab.SHOT_SIZE)} of the subject"
+            if have("occupancy") else "a shot of the subject")
+    if have(SUBJECT_BEARING_KEY):
+        head += f" from the subject's {sector8(bearing)}"
+
+    clauses, nums = [head], []
+    if have("cam_to_obj_elevation_deg"):
+        clauses.append(f"at {_classify(elev, vocab.ELEVATION)}")
+    if have("object_center_x") and have("object_center_y"):
+        clauses.append(f"{_classify(cx / RENDER_WIDTH, vocab.PLACE_X)} and "
+                       f"{_classify(cy / RENDER_HEIGHT, vocab.PLACE_Y)} in the frame")
+    elif have("object_center_x"):
+        clauses.append(f"{_classify(cx / RENDER_WIDTH, vocab.PLACE_X)} in the frame")
+    elif have("object_center_y"):
+        clauses.append(f"{_classify(cy / RENDER_HEIGHT, vocab.PLACE_Y)} in the frame")
+    if have("body_in_frame_ratio"):
+        clauses.append(_classify(body, vocab.BODY_FRAMING))
+    if crop is not None:
+        clauses.append(crop_phrase(float(crop.get("top_cut_frac", 0.0)),
+                                   float(crop.get("bot_cut_frac", 0.0))))
+
+    if have(SUBJECT_BEARING_KEY):
+        nums.append(f"bearing {bearing:.0f}\u00b0")
+    if have("occupancy"):
+        nums.append(f"occupancy {occ:.0f}%")
+    if have("cam_to_obj_elevation_deg"):
+        nums.append(f"elevation {elev:.0f}\u00b0")
+    if have("body_in_frame_ratio"):
+        nums.append(f"body_in_frame {body:.0f}%")
+    if have("object_center_x") and have("object_center_y"):
+        nums.append(f"center {cx:.0f}/{cy:.0f} px")
+    if have("bbox_x_offset") and have("bbox_y_offset"):
+        nums.append(f"half_size {ox:.0f}/{oy:.0f} px")
+    if crop is not None and crop.get("visible_frac") is not None:
+        nums.append(f"visible {float(crop['visible_frac']):.2f}")
+
+    text = f"Move the camera to achieve this shot: {', '.join(clauses)}."
+    return f"{text} ({', '.join(nums)})" if nums else text
 
 
 @dataclass
@@ -131,6 +209,7 @@ def write_lerobot_dataset(
     robot_type: str = "blender_camera",
     overwrite: bool = False,
     resize: int | None = 256,
+    episodes_per_video: int = 20000,
 ) -> Path:
     """Write `episodes` as a LeRobot v3.0 dataset rooted at `out_dir`."""
     import pandas as pd
@@ -158,15 +237,31 @@ def write_lerobot_dataset(
             task_index[ep.prompt] = len(prompts)
             prompts.append(ep.prompt)
 
-    # one mp4 for the whole shard; episodes are addressed by from_timestamp
-    all_frames = [p for ep in episodes for p in ep.frame_paths]
-    video_rel = f"videos/{VIDEO_KEY}/chunk-000/file-000.mp4"
-    _encode_mp4(all_frames, out / video_rel, fps, resize=resize)
+    # Shard the video across several mp4s instead of one file for everything.
+    # Every __getitem__ seeks into its episode by `from_timestamp`, and that seek gets
+    # more expensive as the file grows: a 150k-episode export packed into a single
+    # 3.7 GB / 1.35M-frame mp4 halved training throughput (240 iter/h vs 480 for the
+    # 1.1 GB / 47k-episode one), with both ranks parked in futex_wait on the dataloader
+    # while the GPUs sat at 0-39% util and CPU at 46%. Neither compute nor CPU-bound —
+    # seek cost. Smaller files keep each seek local.
+    n_files = max(1, math.ceil(len(episodes) / max(1, episodes_per_video)))
+    file_of: list[int] = []
+    for fi in range(n_files):
+        group = episodes[fi * episodes_per_video : (fi + 1) * episodes_per_video]
+        _encode_mp4([p for ep in group for p in ep.frame_paths],
+                    out / f"videos/{VIDEO_KEY}/chunk-000/file-{fi:03d}.mp4",
+                    fps, resize=resize)
+        file_of.extend([fi] * len(group))
 
     rows, ep_rows = [], []
     global_index = 0
+    # from_timestamp is relative to the episode's OWN mp4, so the cursor resets per file
     frame_cursor = 0
+    cur_file = 0
     for ep_idx, ep in enumerate(episodes):
+        if file_of[ep_idx] != cur_file:
+            cur_file = file_of[ep_idx]
+            frame_cursor = 0
         start_index = global_index
         for f in range(chunk + 1):
             action = (ep.actions[f] if f < chunk
@@ -191,7 +286,7 @@ def write_lerobot_dataset(
             "meta/episodes/chunk_index": 0,
             "meta/episodes/file_index": 0,
             f"videos/{VIDEO_KEY}/chunk_index": 0,
-            f"videos/{VIDEO_KEY}/file_index": 0,
+            f"videos/{VIDEO_KEY}/file_index": file_of[ep_idx],
             # where this episode starts inside the shared mp4 — load-bearing
             f"videos/{VIDEO_KEY}/from_timestamp": float(frame_cursor / fps),
             f"videos/{VIDEO_KEY}/to_timestamp": float((frame_cursor + chunk + 1) / fps),

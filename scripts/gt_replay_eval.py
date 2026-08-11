@@ -55,7 +55,7 @@ for p in (V12, CF_ROOT):
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--checkpoint", required=True)
-ap.add_argument("--roots", nargs="+", default=["data/trajectories"])
+ap.add_argument("--roots", nargs="+", default=["data/trajectories/v7_stage2_renders_lookat075"])
 ap.add_argument("--lerobot", default="runs/lerobot_v1",
                 help="exported dataset to verify the replay against")
 ap.add_argument("--max-episodes", type=int, default=4000, help="must match the export")
@@ -179,7 +179,7 @@ def replay_export() -> list[dict]:
                 continue
             episodes.append({
                 "index": len(episodes), "placement": name, "data_path": str(path),
-                "window": w, "goal_vec": g, "prompt": goal_prompt(g),
+                "window": w, "goal_vec": g, "prompt": goal_prompt(g, crop=w.goal_frame.raw),
             })
             taken += 1
     return episodes
@@ -241,10 +241,10 @@ def load_policy():
     return pipe.model
 
 
-def make_prompt(goal_vec: np.ndarray) -> str:
+def make_prompt(goal_vec: np.ndarray, crop=None) -> str:
     formatter = ActionPromptJsonFormatter()
     sample = {
-        "ai_caption": goal_prompt(goal_vec),
+        "ai_caption": goal_prompt(goal_vec, crop=crop),
         "viewpoint": "ego_view",
         "conditioning_fps": torch.tensor(args.fps, dtype=torch.long),
         "image_size": torch.tensor([args.image_size, args.image_size]),
@@ -347,7 +347,12 @@ def main() -> int:
     t0 = time.time()
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    frames_dir = out_path.parent / "frames"
+    # Namespaced by the output file, NOT a shared "frames" dir. Two runs writing into
+    # the same directory collide on ep{i}_{tag}.jpg and silently overwrite each
+    # other's renders — the numbers stay correct (they come from env poses) but the
+    # saved images end up belonging to a different scene, which only shows up as a
+    # subject changing mid-strip in the report.
+    frames_dir = out_path.parent / f"frames_{out_path.stem}"
     frames_dir.mkdir(parents=True, exist_ok=True)
 
     print("[replay] enumerating export ...", flush=True)
@@ -389,7 +394,7 @@ def main() -> int:
             gt_chunk = _compute_action_chunk(w)                     # (8, 9) target
             start = w.start
             delta = abs(w.goal_frame.frame_idx - w.start_frame_idx)
-            prompt = make_prompt(ep["goal_vec"])
+            prompt = make_prompt(ep["goal_vec"], crop=w.goal_frame.raw)
 
             # ---- Test A: chunk reproduction, straight off the GT start frame.
             gt_start_img = np.asarray(Image.open(abspath(start.image)).convert("RGB"))
@@ -495,7 +500,8 @@ def main() -> int:
             }
 
     out_path.write_text(json.dumps({
-        "checkpoint": args.checkpoint, "provenance": ver, "args": vars(args) | {"window": None},
+        "checkpoint": args.checkpoint, "provenance": ver,
+        "frames_dir": str(frames_dir), "args": vars(args) | {"window": None},
         "summary": summary, "episodes": results,
     }, indent=2, default=str))
     print(f"\n=== SUMMARY ===\n{json.dumps(summary, indent=2)}", flush=True)

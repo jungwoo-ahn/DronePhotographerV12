@@ -1,3 +1,24 @@
+
+
+# Category words come from src/goal_authoring/vocab.py, the single source of truth. The local
+# copies these replaced had drifted: elevation cut at -25/+10 instead of -20/+15, the label
+# "medium close-up shot" instead of "medium close-up", and an invented "mostly out of frame"
+# band. The same goal therefore read differently depending on which script rendered it.
+from src.goal_authoring import vocab
+from src.goal_authoring.vocab import _classify
+
+
+def shot_size(occ):
+    return _classify(float(occ), vocab.SHOT_SIZE)
+
+
+def elevation_word(el):
+    return _classify(float(el), vocab.ELEVATION)
+
+
+def body_word(b):
+    return _classify(float(b), vocab.BODY_FRAMING)
+
 """Facing-aware goal-prompt gallery for (almost) EVERY object — one representative scene frame per asset
 (occupancy in [20,80], well-composed) + its prompt whose view sector is SUBJECT-RELATIVE
 (azimuth - front_az via runs/facing_map_final.json). Lets us eyeball prompt quality across the whole
@@ -13,23 +34,14 @@ from collections import defaultdict
 
 os.chdir("/home/nas_main/jungwooahn/projects/DronePhotographerV12")
 from PIL import Image
+from src.common.dataset_base import DEFAULT_TRAJ_ROOT
 
 FACING = json.load(open("runs/facing_map_final.json"))
-ROOT = "data/trajectories"
+ROOT = DEFAULT_TRAJ_ROOT
 OUT = "runs/prompt_gallery_all.html"
 EXCLUDE = {"rp_posedplus_00068_18_100k",   # ~100x scale bug
            "Girls-Hugs_5d7050d8"}          # two people hugging -> ambiguous subject/facing
 
-
-def shot_size(occ):
-    for hi, name in [(8, "extreme wide"), (20, "wide"), (38, "medium-wide"),
-                     (58, "medium"), (78, "medium close-up")]:
-        if occ < hi:
-            return name + " shot"
-    return "close-up"
-
-
-SECT8 = ["front", "front-right", "right", "back-right", "back", "back-left", "left", "front-left"]
 
 
 def sector8(b):
@@ -40,13 +52,6 @@ def sector3(b):
     a = abs(((b % 360) + 180) % 360 - 180)
     return "front" if a < 45 else ("back" if a > 135 else "side")
 
-
-def elevation_word(el):
-    if el < -25:
-        return "high angle"
-    if el > 10:
-        return "low angle"
-    return "eye level"
 
 
 def placement_x(x, W):

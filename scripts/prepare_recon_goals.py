@@ -9,25 +9,40 @@ sys.path.insert(0, "/home/nas_main/jungwooahn/projects/DronePhotographerV12")
 os.chdir("/home/nas_main/jungwooahn/projects/DronePhotographerV12")
 import numpy as np
 
+from src.common.annotations import (DEFAULT_GOAL_OCCUPANCY_RANGE,
+                                    DEFAULT_MIN_GOAL_VISIBLE_FRAC,
+                                    _apply_crop_extent, _is_well_framed)
 from src.common.facing import front_azimuth
 from src.common.goal_space import (DEFAULT_GOAL_KEYS, RENDER_HEIGHT, RENDER_WIDTH,
                                    SUBJECT_BEARING_KEY)
 from src.goal_authoring.from_reference import ReferenceEstimator
 
+
+def _framed_raw(record: dict) -> dict:
+    """scores + the crop keys the gate reads (see plan_rerender_yaw for the same helper)."""
+    raw = dict(record.get("scores") or {})
+    bbox = record.get("bbox_xyxy_full")
+    if bbox:
+        _apply_crop_extent(raw, bbox, float(RENDER_HEIGHT))
+    return raw
+
+
 ap = argparse.ArgumentParser()
 ap.add_argument("--cases", type=int, default=6)
-ap.add_argument("--root", default="data/trajectories")
+ap.add_argument("--root", default="data/trajectories/v7_stage2_renders_lookat075")
 ap.add_argument("--out", default="runs/recon_ref/goals.json")
 ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--start-occ", type=float, nargs=2, default=(18.0, 40.0),
                 help="start-pose occupancy window: big enough for the detector to read the subject "
                      "(~10%% was unreadable), small enough to leave the shot to be earned")
-ap.add_argument("--goal-occ", type=float, nargs=2, default=(20.0, 80.0),
-                help="training goal band (annotations.DEFAULT_GOAL_OCCUPANCY_RANGE)")
-ap.add_argument("--min-body", type=float, default=70.0,
-                help="training composition gate (annotations.DEFAULT_MIN_GOAL_BODY_IN_FRAME); the raw "
-                     "renders are 76%% below 50, so without this the reference shots are cut-off junk "
-                     "AND off the policy's training distribution")
+ap.add_argument("--goal-occ", type=float, nargs=2, default=DEFAULT_GOAL_OCCUPANCY_RANGE,
+                help="training goal band; imported, not retyped — the literal (20, 80) here "
+                     "outlived the constant twice")
+ap.add_argument("--min-visible", type=float, default=DEFAULT_MIN_GOAL_VISIBLE_FRAC,
+                help="training composition gate: fraction of the subject's VERTICAL extent in "
+                     "frame. Replaces --min-body 70, which named a constant that no longer "
+                     "exists and picked head-cropped references (72.7%% of accepted goals) "
+                     "while rejecting every chest-up one")
 ap.add_argument("--require-face", type=int, default=1,
                 help="reference must show the face — what makes it a shot worth asking for")
 ap.add_argument("--min-occ-gap", type=float, default=12.0,
@@ -54,9 +69,7 @@ for dn in dirs:
     frames = [r for pair in doc.get("render_records", []) for r in pair
               if (s := r.get("scores")) and r.get("in_frame")
               and args.goal_occ[0] <= s["occupancy"] <= args.goal_occ[1]
-              and s["body_in_frame_ratio"] >= args.min_body
-              and 0 <= s["object_center_x"] <= RENDER_WIDTH
-              and 0 <= s["object_center_y"] <= RENDER_HEIGHT]
+              and _is_well_framed(_framed_raw(r), args.min_visible)]
     if not frames or not doc.get("accepted_pairs"):
         continue
     usable.append((dn, obj, frames, doc))
@@ -105,7 +118,7 @@ for i, (rdn, robj, rframes, _rdoc) in enumerate(usable):
             if not sc or not r.get("in_frame"):
                 continue
             if not (args.start_occ[0] <= sc["occupancy"] <= args.start_occ[1]
-                    and sc["body_in_frame_ratio"] >= 40):
+                    and _is_well_framed(_framed_raw(r), 0.40)):
                 continue
             if abs(sc["occupancy"] - gp.values.get("occupancy", 0.0)) >= args.min_occ_gap:
                 fr = tdoc["accepted_pairs"][pi]["trajectory_32f"][fi]
@@ -125,6 +138,12 @@ for i, (rdn, robj, rframes, _rdoc) in enumerate(usable):
         "ref_scores": ref_rec.get("scores"),
         "tgt_dir": os.path.join(root, tgt[0]), "tgt_object": tgt[1],
         "goal_vec": gvec,
+        # WHICH keys are real. Without this the consumer cannot tell a requested 0 from an
+        # unspecified one, and `goal_prompt` would assert e.g. "centre 0/0 px" — the top-left
+        # corner — for an axis the user never constrained.
+        "goal_specified": sorted(gp.specified),
+        "goal_crop": {k: float(gp.values[k]) for k in
+                      ("top_cut_frac", "bot_cut_frac", "visible_frac") if k in gp.specified},
         "goal": {"occupancy": round(float(gp.values.get("occupancy", 0)), 1),
                  "bearing": round(float(gp.values.get(SUBJECT_BEARING_KEY, 0)), 1),
                  "elevation": round(float(gp.values.get("cam_to_obj_elevation_deg", 0)), 1),

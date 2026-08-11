@@ -3,10 +3,11 @@ subject-relative) or per-asset? For several DISTINCT objects, find the cam->subj
 FRONTAL face detector peaks (= that subject's front), and check cross-object consistency.
 Self-contained; reads data symlink + Haar cascades in assets/. venv: .venv-analysis."""
 import os, sys, json, math, random
+from src.common.dataset_base import DEFAULT_TRAJ_ROOT
 os.chdir("/home/nas_main/jungwooahn/projects/DronePhotographerV12")
 import numpy as np, cv2
 
-ROOT = "data/trajectories"
+ROOT = DEFAULT_TRAJ_ROOT
 fc = cv2.CascadeClassifier("assets/haarcascades/haarcascade_frontalface_default.xml")
 pc = cv2.CascadeClassifier("assets/haarcascades/haarcascade_profileface.xml")
 

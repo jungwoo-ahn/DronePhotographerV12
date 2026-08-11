@@ -7,8 +7,9 @@ os.chdir("/home/nas_main/jungwooahn/projects/DronePhotographerV12")
 import numpy as np
 from src.common.dataset_base import BasePolicyDataset
 from src.common.goal_space import goal_keys as _gk
+from src.common.dataset_base import DEFAULT_TRAJ_ROOT
 
-ROOT = "data/trajectories"
+ROOT = DEFAULT_TRAJ_ROOT
 dirs = sorted(d for d in os.listdir(ROOT) if os.path.isdir(os.path.join(ROOT, d)))
 random.seed(0); random.shuffle(dirs)
 sample_dirs = [os.path.join(ROOT, d) for d in dirs[:300]]  # ~300 placements

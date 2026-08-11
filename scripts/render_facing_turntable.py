@@ -47,10 +47,11 @@ from src.blender.objects import (  # noqa: E402
     parent_and_center,
 )
 from src.blender.bbox import get_world_bbox  # noqa: E402
+from src.common.dataset_base import DEFAULT_TRAJ_ROOT
 
 argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
 ap = argparse.ArgumentParser()
-ap.add_argument("--data-root", default="data/trajectories")
+ap.add_argument("--data-root", default=DEFAULT_TRAJ_ROOT)
 ap.add_argument("--out", default="runs/facing_turntable")
 ap.add_argument("--views", type=int, default=12, help="azimuth samples (every 360/K deg, data convention)")
 ap.add_argument("--res", type=int, default=512)

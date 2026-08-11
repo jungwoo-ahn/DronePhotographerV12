@@ -16,9 +16,12 @@ from src.common.annotations import (
     DEFAULT_DELTA_RANGE,
     DEFAULT_GOAL_OCCUPANCY_RANGE,
     iter_goal_start_windows,
+    DEFAULT_MIN_GOAL_VISIBLE_FRAC,
+    _is_well_framed,
 )
 
-DATA = Path("data/trajectories/Abandoned-alley_9ee2b453__All-People-Are-Sisters_1795d425/data.json")
+DATA = Path("data/trajectories/v7_stage2_renders_lookat075/"
+            "Abandoned-alley_9ee2b453__All-People-Are-Sisters_1795d425/data.json")
 pytestmark = pytest.mark.skipif(not DATA.exists(), reason="v7 dataset not mounted")
 
 CHUNK = 8
@@ -29,7 +32,7 @@ def windows():
     """Scheme mechanics only — composition gates off, so one placement still yields
     enough windows to exercise delta / chunk / direction."""
     return list(iter_goal_start_windows(
-        DATA, chunk_size=CHUNK, min_goal_body_in_frame=0.0,
+        DATA, chunk_size=CHUNK, min_goal_visible_frac=0.0,
         require_goal_center_on_screen=False,
     ))
 
@@ -51,19 +54,39 @@ def test_every_goal_is_in_the_occupancy_band(windows):
 
 
 def test_composition_gate_keeps_only_well_framed_goals(framed_windows, windows):
-    """Occupancy alone admits subjects hanging out of frame — these gates are what
-    make a goal a photograph (median body_in_frame was 34 without them)."""
-    assert 0 < len(framed_windows) < len(windows)
+    """Occupancy alone admits subjects hanging out of frame.
+
+    The gate is `visible_frac`, the fraction of the subject's VERTICAL extent inside the
+    frame — NOT the old `body_in_frame_ratio`, a 2-D area ratio that could not tell which end
+    was cut and so selected beheaded subjects (72.7% of accepted goals) while rejecting every
+    chest-up frame by construction.
+    """
+    assert framed_windows
+    assert len(framed_windows) <= len(windows)
     for w in framed_windows:
         raw = w.goal_frame.raw
-        assert float(raw["body_in_frame_ratio"]) >= 70.0
-        assert 0.0 <= float(raw["object_center_x"]) <= 1024.0
-        assert 0.0 <= float(raw["object_center_y"]) <= 768.0
+        assert float(raw["visible_frac"]) >= DEFAULT_MIN_GOAL_VISIBLE_FRAC
 
 
-def test_composition_gate_can_be_disabled(windows):
-    loose_bodies = [float(w.goal_frame.raw["body_in_frame_ratio"]) for w in windows]
-    assert min(loose_bodies) < 70.0          # the gate really is off in this fixture
+def test_gate_is_crop_side_agnostic(framed_windows):
+    """Both crop directions must survive — the point was to stop PICKING one."""
+    sides = {(float(w.goal_frame.raw["top_cut_frac"]) > 0.02,
+              float(w.goal_frame.raw["bot_cut_frac"]) > 0.02) for w in framed_windows}
+    assert (True, False) in sides or (False, True) in sides
+
+
+def test_gate_rejects_a_subject_that_is_mostly_out_of_frame():
+    """Test the predicate directly, not via one placement's statistics.
+
+    The previous version asserted that the fixture CONTAINED a rejected goal, which made it a
+    test of that placement's distribution rather than of the gate — and it silently stopped
+    exercising the gate once the data improved.
+    """
+    assert not _is_well_framed({"visible_frac": 0.20}, DEFAULT_MIN_GOAL_VISIBLE_FRAC)
+    assert _is_well_framed({"visible_frac": 0.50}, DEFAULT_MIN_GOAL_VISIBLE_FRAC)
+    # a chest-up frame: ~45% of the body, which the retired body_in_frame_ratio >= 70 rule
+    # rejected by construction
+    assert _is_well_framed({"visible_frac": 0.45}, DEFAULT_MIN_GOAL_VISIBLE_FRAC)
 
 
 def test_start_always_sees_the_subject(windows):
@@ -83,9 +106,13 @@ def test_chunk_is_contiguous_and_heads_toward_the_goal_without_overshooting(wind
         assert len(w.keyframes) == CHUNK + 1
         assert w.frame_step == 1
         idxs = [k.frame_idx for k in w.keyframes]
-        assert idxs == list(range(idxs[0], idxs[0] + w.direction * (CHUNK + 1), w.direction))
-        # moving toward the goal, and stopping at or before it
-        assert w.direction == (1 if w.goal_frame.frame_idx > w.start_frame_idx else -1)
+        # Contiguous while it is still travelling, then CLAMPED at the goal — the repeated
+        # trailing frames are what make the tail actions exactly zero.
+        walked = [min(i, w.goal_frame.frame_idx) if w.direction > 0
+                  else max(i, w.goal_frame.frame_idx)
+                  for i in range(idxs[0], idxs[0] + w.direction * (CHUNK + 1), w.direction)]
+        assert idxs == walked
+        # never past the goal
         assert w.direction * (w.goal_frame.frame_idx - w.end_frame_idx) >= 0
 
 
@@ -95,7 +122,7 @@ def test_scheme_is_bidirectional(windows):
 
 
 def test_cap_is_deterministic_and_respected():
-    kw = dict(chunk_size=CHUNK, max_per_pair=15, min_goal_body_in_frame=0.0,
+    kw = dict(chunk_size=CHUNK, max_per_pair=15, min_goal_visible_frac=0.0,
               require_goal_center_on_screen=False)
     a = list(iter_goal_start_windows(DATA, **kw))
     b = list(iter_goal_start_windows(DATA, **kw))
@@ -107,10 +134,19 @@ def test_cap_is_deterministic_and_respected():
     assert max(per_pair.values()) <= 15
 
 
-def test_delta_below_chunk_size_is_rejected():
-    """delta < chunk_size would let the chunk run past the goal."""
-    with pytest.raises(ValueError):
-        next(iter_goal_start_windows(DATA, chunk_size=CHUNK, delta_range=(4, 32)))
+def test_delta_below_chunk_size_is_allowed_and_clamps_at_the_goal():
+    """delta < chunk_size is now the POINT: the trailing steps repeat the goal frame, and
+    their zero action deltas are the only 'you have arrived, hold still' supervision there is.
+    The old rule forbade it to stop labels overshooting, which is exactly why the policy had
+    never seen a state closer than chunk_size to its goal."""
+    ws = [w for w in iter_goal_start_windows(DATA, chunk_size=CHUNK, delta_range=(0, 32),
+                                             max_per_pair=40)
+          if abs(w.goal_frame.frame_idx - w.start_frame_idx) < CHUNK]
+    assert ws, "no near-goal windows produced"
+    for w in ws[:5]:
+        idx = [k.frame_idx for k in w.keyframes]
+        assert idx[-1] == w.goal_frame.frame_idx          # clamped, never past the goal
+        assert len(set(idx[-2:])) == 1 or idx[-1] == idx[-2]  # trailing steps repeat -> zero action
 
 
 def test_dataset_produces_9d_actions_and_a_subject_frame_goal():
@@ -138,7 +174,7 @@ def test_bearing_balanced_weights_even_out_the_view_sectors():
 
     ds = BasePolicyDataset(
         [str(DATA.parent)], chunk_size=CHUNK, sampling_scheme="goal_start",
-        min_goal_body_in_frame=0.0, require_goal_center_on_screen=False,
+        min_goal_visible_frac=0.0, require_goal_center_on_screen=False,
         max_windows_per_pair=40,
     )
     w = ds.bearing_balanced_weights()

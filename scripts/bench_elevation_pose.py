@@ -14,8 +14,9 @@ if not hasattr(cv2, "imshow"):
 from ultralytics import YOLO
 
 from src.goal_authoring import vocab
+from src.common.dataset_base import DEFAULT_TRAJ_ROOT
 
-ROOT = "data/trajectories"
+ROOT = DEFAULT_TRAJ_ROOT
 CACHE = "runs/elevation_feats.npz"
 REFRESH = "--refresh" in sys.argv
 

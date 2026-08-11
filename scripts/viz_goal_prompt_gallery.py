@@ -1,3 +1,24 @@
+
+
+# Category words come from src/goal_authoring/vocab.py, the single source of truth. The local
+# copies these replaced had drifted: elevation cut at -25/+10 instead of -20/+15, the label
+# "medium close-up shot" instead of "medium close-up", and an invented "mostly out of frame"
+# band. The same goal therefore read differently depending on which script rendered it.
+from src.goal_authoring import vocab
+from src.goal_authoring.vocab import _classify
+
+
+def shot_size(occ):
+    return _classify(float(occ), vocab.SHOT_SIZE)
+
+
+def elevation_word(el):
+    return _classify(float(el), vocab.ELEVATION)
+
+
+def body_word(b):
+    return _classify(float(b), vocab.BODY_FRAMING)
+
 """Validate the DRAFT cinematography goal-descriptor against real renders.
 For a shot-size x angle STRATIFIED sample of frames, show: rendered image + the draft NL prompt
 (cinematography words + concrete numbers) + the raw 8-key profile. Lets us eyeball whether the
@@ -9,26 +30,18 @@ import os, sys, json, random, base64, io
 sys.path.insert(0, "/home/nas_main/jungwooahn/projects/DronePhotographerV12")
 os.chdir("/home/nas_main/jungwooahn/projects/DronePhotographerV12")
 from PIL import Image
+from src.common.dataset_base import DEFAULT_TRAJ_ROOT
 
-ROOT = "data/trajectories"
+ROOT = DEFAULT_TRAJ_ROOT
 OUT = "runs/goal_prompt_gallery.html"
 
 # ---------- DRAFT cinematography serializer (profile -> words + numbers) ----------
-def shot_size(occ):
-    for hi, name in [(8,"extreme wide shot"),(20,"wide shot"),(38,"medium-wide shot"),
-                     (58,"medium shot"),(78,"medium close-up")]:
-        if occ < hi: return name
-    return "close-up"
 
 def azimuth_sector(az):  # 0..360, camera bearing around subject (convention TBD — image validates)
     az %= 360
     secs = ["front","front-right","right","back-right","back","back-left","left","front-left"]
     return secs[int(((az+22.5)%360)//45)]
 
-def elevation_word(el):  # cam_to_obj elevation; negative => subject below camera => high angle (assumed)
-    if el < -25: return "high angle (looking down)"
-    if el > 10:  return "low angle (looking up)"
-    return "eye level"
 
 def placement_x(x, W):
     if x < 0 or x > W: return "off-screen " + ("left" if x < 0 else "right")
@@ -40,10 +53,6 @@ def placement_y(y, H):
     t = y / H
     return "upper" if t < 0.38 else ("lower" if t > 0.62 else "mid")
 
-def body_word(b):
-    if b >= 90: return "full body in frame"
-    if b >= 50: return f"partially cut off (~{b}% of body visible)"
-    return f"mostly out of frame (~{b}% visible)"
 
 def serialize(s, W, H):
     occ, body = s["occupancy"], s["body_in_frame_ratio"]

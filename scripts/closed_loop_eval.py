@@ -57,6 +57,14 @@ import numpy as np
 ap = argparse.ArgumentParser()
 ap.add_argument("--checkpoint", required=True)
 ap.add_argument("--episodes", type=int, default=24)
+ap.add_argument("--held-out-only", type=int, default=1,
+                help="skip placements the export actually consumed (1 = on). NOT optional for "
+                     "a generalization claim: the export takes 4 episodes from each of only "
+                     "~1000 placements, and this script used to draw from the same shuffled "
+                     "list, so every evaluated placement was one the model trained on.")
+ap.add_argument("--export-seed", type=int, default=0, help="must match the export")
+ap.add_argument("--export-max-episodes", type=int, default=4000, help="must match the export")
+ap.add_argument("--export-per-placement", type=int, default=4, help="must match the export")
 ap.add_argument("--per-sector", type=int, default=0,
                 help="cap episodes per view sector (0 = off). Balances coverage across the "
                      "eight sectors instead of following the back-heavy data, so raising "
@@ -80,8 +88,11 @@ ap.add_argument("--guidance", type=float, default=1.0,
                      "never seen an empty caption and a CFG uncond branch would be noise.")
 ap.add_argument("--image-size", type=int, default=256)
 ap.add_argument("--fps", type=int, default=30)
-ap.add_argument("--root", default=f"{V12}/data/trajectories")
+ap.add_argument("--root", default=f"{V12}/data/trajectories/v7_stage2_renders_lookat075")
 ap.add_argument("--out", default=f"{V12}/runs/closed_loop/eval.json")
+ap.add_argument("--resume", type=int, default=1,
+                help="continue from <out>.partial.json instead of redoing "
+                     "episodes a preempted run already finished")
 ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--no-ema", action="store_true", help="load raw weights instead of EMA")
 args = ap.parse_args()
@@ -142,8 +153,13 @@ def load_policy():
     return pipe.model
 
 
-def make_prompt(goal_vec: np.ndarray) -> str:
+def make_prompt(goal_vec: np.ndarray, crop=None) -> str:
     """The goal as the JSON string the model was trained on.
+
+    `crop` is not optional in practice: the exporter always passes it
+    (`export_lerobot.py` -> `goal_prompt(g, crop=w.goal_frame.raw)`), so every training
+    prompt ends with a crop phrase and a `visible` number. Omitting it here made every
+    rollout so far ask the policy with a prompt shape it had never seen.
 
     Training prompts carry `idle_frame`, and the stock inference path drops it, so
     pass mode/idle_frames explicitly — otherwise the prompt drifts from training in
@@ -154,7 +170,7 @@ def make_prompt(goal_vec: np.ndarray) -> str:
     # reading fps/size/idle from the same keys the dataset uses — hence `viewpoint`
     # and `conditioning_fps`, not `view_point`/`fps`.
     sample = {
-        "ai_caption": goal_prompt(goal_vec),
+        "ai_caption": goal_prompt(goal_vec, crop=crop),
         "viewpoint": "ego_view",
         "conditioning_fps": torch.tensor(args.fps, dtype=torch.long),
         "image_size": torch.tensor([args.image_size, args.image_size]),
@@ -217,6 +233,75 @@ def write_run_info(placement: str, data_path: str, out_dir: Path) -> str:
                            shared_root=SHARED, resolution=args.image_size)
 
 
+def trained_placements() -> set[str]:
+    """Placement names the export actually consumed.
+
+    Replays `scripts/export_lerobot.py`'s enumeration — same seed, same order of
+    `random` consumption — and collects which placements contributed an episode.
+    Verified elsewhere to reproduce the export prompt-for-prompt (4000/4000).
+
+    This has to be computed rather than assumed. The export stops at
+    `max_episodes` and takes `per_placement` episodes from each, so 4000 episodes
+    come from only ~1000 of the 3931 placements; the remaining ~2931 are genuinely
+    unseen. Drawing "held-out" episodes from the same shuffled directory listing —
+    which this script did until now — landed on trained placements every time.
+    """
+    # Cache: replaying the enumeration costs ~35 min over 7.7k placements at
+    # max_per_pair=24, and every shard of a split eval would otherwise pay it again.
+    # Keyed by the parameters that define the trained set, so a changed export cannot
+    # silently reuse a stale answer.
+    r = Path(args.root)
+    key = (f"{r.name}_s{args.export_seed}_m{args.export_max_episodes}"
+           f"_p{args.export_per_placement}_c{args.chunk_size}")
+    cache = Path(args.out).parent / f"_trained_{key}.json"
+    if cache.exists():
+        try:
+            used = set(json.loads(cache.read_text()))
+            print(f"[eval] trained set from cache: {len(used)} placements ({cache.name})",
+                  flush=True)
+            return used
+        except Exception:  # noqa: BLE001
+            pass
+
+    placements = [(d, r / d / "data.json") for d in sorted(os.listdir(r))
+                  if (r / d / "data.json").exists()]
+    random.seed(args.export_seed)
+    random.shuffle(placements)
+
+    used: set[str] = set()
+    n_ep = 0
+    for name, path in placements:
+        if n_ep >= args.export_max_episodes:
+            break
+        obj = name.split("__", 1)[1] if "__" in name else name
+        if obj in DEFAULT_EXCLUDE_OBJECTS:
+            continue
+        try:
+            windows = list(iter_goal_start_windows(
+                path, chunk_size=args.chunk_size, max_per_pair=args.export_per_placement))
+        except Exception:  # noqa: BLE001
+            continue
+        random.shuffle(windows)
+        taken = 0
+        for w in windows:
+            if taken >= args.export_per_placement or n_ep >= args.export_max_episodes:
+                break
+            g = goal_vector(w.goal_frame.raw, DEFAULT_GOAL_KEYS, object_key=_window_object(w))
+            if not np.isfinite(g).all():
+                continue
+            if not all(Path(k.image).exists() for k in w.keyframes):
+                continue
+            used.add(name)
+            n_ep += 1
+            taken += 1
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(sorted(used)))
+    except Exception:  # noqa: BLE001
+        pass          # a cache miss is slow, not wrong
+    return used
+
+
 def pick_episodes() -> list:
     """Held-out (start, goal) pairs, one per placement for scene diversity.
 
@@ -230,7 +315,17 @@ def pick_episodes() -> list:
     sectors legitimately cannot fill, and the summary reports what was actually found
     rather than silently returning a lopsided set.
     """
+    # comma list so one sweep can be split across GPUs by sector
+    wanted = {x.strip() for x in args.sector.split(",") if x.strip()}
     dirs = sorted(d for d in os.listdir(args.root) if os.path.isdir(os.path.join(args.root, d)))
+    trained: set[str] = set()
+    if args.held_out_only:
+        trained = trained_placements()
+        dirs = [d for d in dirs if d not in trained]
+        print(f"[eval] held-out pool: {len(dirs)} placements "
+              f"({len(trained)} excluded as trained-on)", flush=True)
+    # Own generator, seeded separately from the export replay above, which consumed
+    # the global one.
     rng = random.Random(args.seed)
     rng.shuffle(dirs)
     picked: list = []
@@ -259,8 +354,17 @@ def pick_episodes() -> list:
                 continue
             bearing = float(g[DEFAULT_GOAL_KEYS.index(SUBJECT_BEARING_KEY)])
             sec = sector8(bearing)
-            if args.sector and args.sector not in (sec, sector3(bearing)):
-                continue
+            if wanted:
+                # Exact sector8 match when the token names one, because sector3 returns
+                # "front"/"side"/"back" and those two names COLLIDE with sector8's. A
+                # plain membership test made `--sector back` also accept back-left and
+                # back-right, which silently overlapped two supposedly disjoint jobs.
+                if sec in wanted:
+                    pass
+                elif any(t not in SECTOR_ORDER for t in wanted) and sector3(bearing) in wanted:
+                    pass
+                else:
+                    continue
             if cap and per_sector[sec] >= cap:
                 continue          # this sector is full; try another window/placement
             picked.append((name, path, w, g, bearing, sec))
@@ -288,12 +392,34 @@ def main() -> int:
     model = load_policy()
     print(f"[eval] policy loaded ({time.time()-t0:.0f}s)", flush=True)
     intr = CameraIntrinsics.from_render(1024, 768)
+    # Resume from a previous run's partial output. This eval keeps getting preempted on
+    # `share` at ~30 min, and without this every restart redoes the episodes it already
+    # finished — 80 episodes at ~3.5 min each never completes in a 30-min window. With it
+    # the progress accumulates across as many preemptions as it takes.
     results = []
+    done_keys: set = set()
+    _partial_path = Path(args.out).with_suffix(".partial.json")
+    if args.resume and _partial_path.exists():
+        try:
+            prev = json.loads(_partial_path.read_text()).get("episodes", [])
+            results = list(prev)
+            done_keys = {(e.get("placement"), e.get("start_frame_image"),
+                          e.get("goal_frame_image")) for e in prev}
+            print(f"[eval] resuming: {len(results)} episodes already done", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[eval] partial unreadable, starting fresh: {exc}", flush=True)
 
-    frames_dir = Path(args.out).parent / "frames"
+    # Namespaced by the output file, NOT a shared "frames" dir. Two runs writing into
+    # the same directory collide on ep{i}_{tag}.jpg and silently overwrite each
+    # other's renders — the numbers stay correct (they come from env poses) but the
+    # saved images end up belonging to a different scene, which only shows up as a
+    # subject changing mid-strip in the report.
+    frames_dir = Path(args.out).parent / f"frames_{Path(args.out).stem}"
     frames_dir.mkdir(parents=True, exist_ok=True)
 
     for i, (name, path, window, goal_vec, bearing, sec) in enumerate(episodes):
+        if (name, window.start.image, window.goal_frame.image) in done_keys:
+            continue
         try:
             delta = abs(window.goal_frame.frame_idx - window.start_frame_idx)
             # However many chunks the goal actually is away — a fixed count would make
@@ -322,7 +448,7 @@ def main() -> int:
 
             shots.append({"tag": "start", "path": save("start", obs["image"]), "d": d0})
 
-            prompt = make_prompt(goal_vec)
+            prompt = make_prompt(goal_vec, crop=window.goal_frame.raw)
             for c in range(n_chunks):
                 frame = np.asarray(obs["image"])
                 chunk = predict_chunk(model, frame, prompt, seed=args.seed + i * 100 + c)
@@ -350,6 +476,19 @@ def main() -> int:
             print(f"[eval] {i+1}/{len(episodes)} {sec:11s} delta={delta:2d} x{n_chunks} "
                   f"{name[:34]:34s} d {d0:.4f} -> {d1:.4f} (best {d_best:.4f}) "
                   f"imp {d0-d1:+.4f}", flush=True)
+            # Flush after every episode. This runs on preemptible capacity and writing
+            # only at the end has already cost two ~16-minute runs whose episodes were
+            # complete but unrecoverable. Written via a temp file + replace so a kill
+            # mid-write cannot leave a truncated JSON behind.
+            _partial = Path(args.out).with_suffix(".partial.json")
+            _partial.parent.mkdir(parents=True, exist_ok=True)
+            _tmp = _partial.with_suffix(".tmp")
+            _tmp.write_text(json.dumps(
+                {"summary": {"checkpoint": args.checkpoint, "episodes": len(results),
+                             "held_out_only": bool(args.held_out_only),
+                             "frames_dir": str(frames_dir), "partial": True},
+                 "episodes": results}, indent=1))
+            _tmp.replace(_partial)
         except Exception as exc:  # noqa: BLE001
             print(f"[eval] {i+1} FAILED {name[:40]}: {type(exc).__name__}: {exc}", flush=True)
 
@@ -373,6 +512,8 @@ def main() -> int:
         "frac_positive": float((imp > 0).mean()),
         "mean_d_start": float(np.mean([r["d_start"] for r in results])),
         "mean_d_end": float(np.mean([r["d_end"] for r in results])),
+        "held_out_only": bool(args.held_out_only),
+        "frames_dir": str(frames_dir),
         "guidance": args.guidance, "num_steps": args.num_steps,
         "chunks": args.chunks, "ema": not args.no_ema,
         "elapsed_s": time.time() - t0,

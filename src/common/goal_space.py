@@ -126,7 +126,9 @@ def goal_vector(
         if k == SUBJECT_BEARING_KEY:
             world_az = _raw(WORLD_AZIMUTH_KEY)
             if world_az is not None and object_key:
-                bearing = subject_bearing_deg(world_az, object_key)
+                # 0 on original data, so those bearings are unchanged.
+                yaw = _raw("placement_yaw_deg") or 0.0
+                bearing = subject_bearing_deg(world_az, object_key, yaw_deg=yaw)
                 if bearing is not None:
                     out[i] = bearing
             continue

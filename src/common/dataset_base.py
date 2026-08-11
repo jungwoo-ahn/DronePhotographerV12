@@ -52,7 +52,7 @@ from src.common.action_repr import ACTION_DIM, encode_action_9d
 from src.common.annotations import (
     DEFAULT_DELTA_RANGE,
     DEFAULT_GOAL_OCCUPANCY_RANGE,
-    DEFAULT_MIN_GOAL_BODY_IN_FRAME,
+    DEFAULT_MIN_GOAL_VISIBLE_FRAC,
     TrajectoryWindow,
     ViewRecord,
     iter_goal_start_windows,
@@ -67,6 +67,19 @@ from src.common.reward import VALUE_SCALE, pose_distance_value
 GOAL_SAMPLING_MODES = ("uniform_future", "end")
 SAMPLING_SCHEMES = ("sliding_window", "multiscale_bidir", "goal_start")
 DEFAULT_MULTISCALE_OFFSETS = (8, 16, 24)
+
+# The trajectory tree everything current reads. It sits INSIDE the older one:
+#
+#   data/trajectories/                              <- 3932 original placements
+#   data/trajectories/v7_stage2_renders_lookat075/  <- 7885 re-renders (this constant)
+#
+# 3931 of the 7885 names appear in both, so a script pointed at the parent silently
+# reads the superseded renders under the right-looking names — same placement, camera
+# aimed at mid-torso (look-at 0.500) and no per-object yaw. That is the pool the
+# visible_frac gate and the yaw re-render were meant to replace. Nesting the new tree
+# under the old one made the mistake invisible; import this instead of hardcoding.
+DEFAULT_TRAJ_ROOT = "data/trajectories/v7_stage2_renders_lookat075"
+LEGACY_TRAJ_ROOT = "data/trajectories"
 
 # Objects dropped from BOTH splits — defective data, not a train/val split concern:
 #   rp_posedplus_00068_18_100k — ~100x scale bug (subject_height 169 m vs a ~1.7 m
@@ -328,7 +341,7 @@ class BasePolicyDataset(Dataset):
         offsets: Sequence[int] = DEFAULT_MULTISCALE_OFFSETS,
         delta_range: tuple[int, int] = DEFAULT_DELTA_RANGE,
         goal_occupancy_range: tuple[float, float] = DEFAULT_GOAL_OCCUPANCY_RANGE,
-        min_goal_body_in_frame: float = DEFAULT_MIN_GOAL_BODY_IN_FRAME,
+        min_goal_visible_frac: float = DEFAULT_MIN_GOAL_VISIBLE_FRAC,
         require_goal_center_on_screen: bool = True,
         min_start_occupancy: float = 1.0,
         max_windows_per_pair: int = 0,
@@ -363,7 +376,7 @@ class BasePolicyDataset(Dataset):
         self.offsets = tuple(offsets)
         self.delta_range = (int(delta_range[0]), int(delta_range[1]))
         self.goal_occupancy_range = (float(goal_occupancy_range[0]), float(goal_occupancy_range[1]))
-        self.min_goal_body_in_frame = float(min_goal_body_in_frame)
+        self.min_goal_visible_frac = float(min_goal_visible_frac)
         self.require_goal_center_on_screen = bool(require_goal_center_on_screen)
         self.min_start_occupancy = float(min_start_occupancy)
         self.max_windows_per_pair = int(max_windows_per_pair)
@@ -379,7 +392,7 @@ class BasePolicyDataset(Dataset):
                     chunk_size=chunk_size,
                     delta_range=self.delta_range,
                     goal_occupancy_range=self.goal_occupancy_range,
-                    min_goal_body_in_frame=self.min_goal_body_in_frame,
+                    min_goal_visible_frac=self.min_goal_visible_frac,
                     require_goal_center_on_screen=self.require_goal_center_on_screen,
                     min_start_occupancy=self.min_start_occupancy,
                     max_per_pair=self.max_windows_per_pair,

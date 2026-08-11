@@ -26,6 +26,10 @@ ALLOWED: dict[str, tuple[str, ...]] = {
     "bearing": tuple(SECTOR8) + ("front", "side", "back"),
     "placement_x": tuple(vocab.PLACE_X),
     "placement_y": tuple(vocab.PLACE_Y),
+    # Which END the frame cuts. `body_framing` cannot express this — it bins an AREA ratio, so
+    # "head cropped" and "legs cropped" land in the same band, which is what let the training
+    # gate select beheaded subjects for months.
+    "crop_side": tuple(vocab.CROP_SIDE),
 }
 
 Classifier = Callable[[str], Mapping[str, str]]
@@ -83,6 +87,14 @@ _RULES: list[tuple[str, tuple[str, str]]] = [
     (r"\bfull body|full[- ]length|head to toe\b", ("body_framing", "full body in frame")),
     (r"\btightly cropped|cropped (in )?tight|just the (face|head)\b", ("body_framing", "tightly cropped")),
     (r"\bpartially (cut|cropped)|partly out of frame\b", ("body_framing", "partially cut off")),
+    (r"\b(head|face) (is )?(cut|cropped)( off)?|cropped (above|at) the head|top (is )?cut\b",
+     ("crop_side", "cropped above the head")),
+    (r"\bcropped below the waist|waist[- ]up|from the waist up\b",
+     ("crop_side", "cropped below the waist")),
+    (r"\bcropped at the (legs|knees)|knee[- ]up|legs (are )?(cut|cropped)\b",
+     ("crop_side", "cropped at the legs")),
+    (r"\bwhole subject in frame|nothing (is )?(cut|cropped)|uncropped\b",
+     ("crop_side", "uncropped")),
 ]
 
 

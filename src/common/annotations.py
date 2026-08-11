@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import random
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -142,6 +143,39 @@ def _apply_visible_geometry(raw: dict, width: int, height: int) -> None:
                               float(raw.get("cam_to_obj_elevation_deg") or 0.0))
     for k in ("object_center_x", "object_center_y", "bbox_x_offset", "bbox_y_offset"):
         raw[k] = fixed[k]
+    _apply_crop_extent(raw, bbox, float(height or RENDER_HEIGHT))
+
+
+def _apply_crop_extent(raw: dict, bbox, height: float) -> None:
+    """Which END of the subject the frame cuts, and how much of it survives.
+
+    Everything else in the profile is sign-destroying: `occupancy` and
+    `body_in_frame_ratio` are area ratios and `object_center_y` is clipped on
+    screen, so a beheaded subject and a chest-up portrait are indistinguishable.
+    Measured consequence: the `body_in_frame_ratio >= 70` gate admitted goals that
+    were 72.7% head-cropped, and rejected EVERY bust-extent frame (a chest-up shot
+    shows 35-60% of the body, so it cannot clear 70 by construction).
+
+    `bbox_xyxy_full` is the unclipped signed projection — it really does carry
+    negative y0 and y1 beyond the frame — so the distinction is exact here, with no
+    re-render, no keypoints and no detector.
+
+    `visible_frac` is deliberately crop-side AGNOSTIC: it is the gate quantity, and
+    gating on it preserves whatever top/bottom mix the pool happens to have instead
+    of selecting one end. `top_cut_frac` / `bot_cut_frac` carry the side, for the
+    prompt and for reporting.
+    """
+    try:
+        y0, y1 = float(bbox[1]), float(bbox[3])
+    except (TypeError, IndexError, ValueError):
+        return
+    span = y1 - y0
+    if span <= 0:
+        return
+    raw["head_in_frame"] = bool(y0 >= 0.0)
+    raw["top_cut_frac"] = max(0.0, -y0) / span
+    raw["bot_cut_frac"] = max(0.0, y1 - height) / span
+    raw["visible_frac"] = max(0.0, min(y1, height) - max(y0, 0.0)) / span
 
 
 def _frame_to_view(
@@ -169,6 +203,12 @@ def _frame_to_view(
     raw = dict(frame)
     raw.update(scores)
     raw["frame_idx"] = frame_idx
+    # Placement-level, but carried per frame on purpose: `goal_vector` reads the goal
+    # out of a single frame's `raw`, and threading a new argument through the six call
+    # sites instead would let one be forgotten — which fails silently, as a wrong
+    # bearing rather than an error. Absent on original (un-re-rendered) data, where 0
+    # reproduces the previous behaviour exactly.
+    raw["placement_yaw_deg"] = float(doc.get("placement_yaw_deg") or 0.0)
     if render_record is not None:
         raw["bbox_xyxy_full"] = render_record.get("bbox_xyxy_full")
         raw["in_frame"] = render_record.get("in_frame")
@@ -342,25 +382,75 @@ def iter_multiscale_windows(
                     )
 
 
-DEFAULT_GOAL_OCCUPANCY_RANGE = (20.0, 80.0)
-DEFAULT_DELTA_RANGE = (8, 32)
+# Floor 10, not 20. The floor is a FRAMING filter in disguise: an uncropped subject is
+# one shot from far enough away to fit, so it occupies little of the frame. At 20 the
+# gate kept only 7.9% uncropped goals and doubled 'both ends cut' to 32.7%; at 10 the
+# post-gate crop mix (17.4/42.3/20.5/19.8) tracks the pool's own (15.9/50.9/17.4/15.8).
+DEFAULT_GOAL_OCCUPANCY_RANGE = (10.0, 80.0)
+# Lower bound 0, not chunk_size: a start that already sits AT the goal yields an
+# all-zero chunk, the only way the policy can learn to stop. `near_fraction` below
+# controls how much of that appears, because letting it emerge from the raw pair
+# counts would flood the set with near-goal starts and teach the policy to sit still.
+DEFAULT_DELTA_RANGE = (0, 32)
+DEFAULT_NEAR_FRACTION = 0.25
 # Occupancy alone does NOT mean "well framed": it comes from the UNCLIPPED mesh-tight
-# bbox, so a subject can fill 40% of the frame while hanging half outside it. Measured
-# over goals that pass occupancy 20-80: body_in_frame median 34 (i.e. two thirds of the
-# body out of frame) and the subject's centre off-screen in 35% of them. These two extra
-# gates are what actually make a goal a photograph.
-DEFAULT_MIN_GOAL_BODY_IN_FRAME = 70.0
+# bbox, so a subject can fill 40% of the frame while hanging half outside it. But the
+# old fix — body_in_frame_ratio >= 70 — was an AREA ratio, blind to which end of the
+# subject the frame cuts. It selected goals that were 72.7% head-cropped and rejected
+# every chest-up frame by construction (those show 35-60% of the body).
+#
+# 0.35 of the subject's VERTICAL extent is "at least a bust's worth is in frame",
+# whichever end is cut. It is deliberately not a crop-side filter: the pool's own
+# top/bottom mix is what we want to keep.
+DEFAULT_MIN_GOAL_VISIBLE_FRAC = 0.35
+
+
+_WARNED_NO_VISIBLE_FRAC = False
 
 
 def _is_well_framed(
-    raw: dict, min_body_in_frame: float, require_center_on_screen: bool
+    raw: dict, min_visible_frac: float, require_center_on_screen: bool = False
 ) -> bool:
-    """Composition gates a goal frame must pass on top of its occupancy band."""
+    """Composition gate a goal frame must pass on top of its occupancy band.
+
+    Gates on `visible_frac` — how much of the subject's vertical extent survives the
+    frame — rather than on `body_in_frame_ratio`. The old ratio is a 2D AREA ratio and
+    therefore blind to WHICH end is cut, so `>= 70` scored a beheaded subject and a
+    chest-up portrait identically and happened to select the beheaded one (72.7% of
+    accepted goals). It also excluded every bust-extent frame by construction: a
+    chest-up shot shows 35-60% of the body and can never reach 70.
+
+    `visible_frac` is crop-side agnostic on purpose. The point is to stop the gate
+    from PICKING a crop direction, so the pool's own top/bottom mix survives; the
+    side itself lives in `top_cut_frac` / `bot_cut_frac` for the prompt.
+
+    `require_center_on_screen` is retained only so existing callers keep working, and
+    defaults off: `_apply_visible_geometry` recomputes the centre from the CLIPPED
+    bbox, so it is on screen by construction and the check can now only reject a frame
+    whose keys are missing entirely.
+    """
     if not isinstance(raw, dict):
         return False
-    if min_body_in_frame > 0.0:
-        body = raw.get("body_in_frame_ratio")
-        if body is None or float(body) < min_body_in_frame:
+    if min_visible_frac > 0.0:
+        vis = raw.get("visible_frac")
+        if vis is None:
+            # No signed bbox (no render record). Fall back to the old AREA ratio so a missing
+            # key cannot silently empty the dataset — but say so once. Passing a raw on-disk
+            # `scores` dict lands here, and then this gate silently measures something else
+            # entirely (area, not vertical extent); two callers looked migrated for exactly
+            # that reason. Enrich the dict via `_apply_crop_extent` instead.
+            global _WARNED_NO_VISIBLE_FRAC
+            if not _WARNED_NO_VISIBLE_FRAC:
+                _WARNED_NO_VISIBLE_FRAC = True
+                warnings.warn(
+                    "_is_well_framed: no 'visible_frac' — falling back to body_in_frame_ratio, "
+                    "which is an AREA ratio and cannot tell which end of the subject is cut. "
+                    "Pass a raw enriched by _apply_crop_extent (needs bbox_xyxy_full).",
+                    RuntimeWarning, stacklevel=2)
+            body = raw.get("body_in_frame_ratio")
+            if body is None or float(body) / 100.0 < min_visible_frac:
+                return False
+        elif float(vis) < min_visible_frac:
             return False
     if require_center_on_screen:
         cx, cy = raw.get("object_center_x"), raw.get("object_center_y")
@@ -371,13 +461,42 @@ def _is_well_framed(
     return True
 
 
+
+def is_goal_frame(record: dict, *,
+                  occupancy_range: tuple[float, float] | None = None,
+                  min_visible_frac: float | None = None) -> bool:
+    """Would this render record qualify as a training goal?
+
+    One importable definition of "a usable shot", so the answer cannot drift per script. It
+    was copy-pasted into eight of them with five different thresholds
+    (`30 <= occupancy <= 92 and body_in_frame_ratio >= 45`, and 88/90/50/70 variants), all
+    written against the retired area ratio.
+
+    Takes the whole record, not just `record["scores"]`, because the gate needs the signed
+    `bbox_xyxy_full` that sits beside them.
+    """
+    scores = record.get("scores")
+    if not scores or not record.get("in_frame", True):
+        return False
+    lo, hi = occupancy_range or DEFAULT_GOAL_OCCUPANCY_RANGE
+    occ = scores.get("occupancy")
+    if occ is None or not (lo <= float(occ) <= hi):
+        return False
+    raw = dict(scores)
+    bbox = record.get("bbox_xyxy_full")
+    if bbox:
+        _apply_crop_extent(raw, bbox, float(RENDER_HEIGHT))
+    thr = DEFAULT_MIN_GOAL_VISIBLE_FRAC if min_visible_frac is None else min_visible_frac
+    return _is_well_framed(raw, thr)
+
 def iter_goal_start_windows(
     data_json_path: str | Path,
     *,
     chunk_size: int = 8,
     delta_range: tuple[int, int] = DEFAULT_DELTA_RANGE,
+    near_fraction: float = DEFAULT_NEAR_FRACTION,
     goal_occupancy_range: tuple[float, float] = DEFAULT_GOAL_OCCUPANCY_RANGE,
-    min_goal_body_in_frame: float = DEFAULT_MIN_GOAL_BODY_IN_FRAME,
+    min_goal_visible_frac: float = DEFAULT_MIN_GOAL_VISIBLE_FRAC,
     require_goal_center_on_screen: bool = True,
     min_start_occupancy: float = 1.0,
     max_per_pair: int = 0,
@@ -393,10 +512,10 @@ def iter_goal_start_windows(
     So, per trajectory:
       * goal g — a WELL-FRAMED frame: occupancy in `goal_occupancy_range` (the upper
         bound drops saturated close-ups, the lower one the empty tail), at least
-        `min_goal_body_in_frame` percent of the body inside the frame, and (by default)
+        `min_goal_visible_frac` of the subject's vertical extent inside the frame,
         the subject's centre actually on screen. The last two gates matter: occupancy
         is computed from the unclipped bbox, so on its own it admits subjects hanging
-        half out of frame (see DEFAULT_MIN_GOAL_BODY_IN_FRAME).
+        and whichever end is cut (see DEFAULT_MIN_GOAL_VISIBLE_FRAC).
       * start s — any frame with `delta_range[0] <= |g - s| <= delta_range[1]` whose
         occupancy exceeds `min_start_occupancy`, so the policy never has to act from a
         frame where the subject is invisible. Both signs are used, which gives the
@@ -416,11 +535,8 @@ def iter_goal_start_windows(
     render_records = doc.get("render_records") or []
 
     d_min, d_max = int(delta_range[0]), int(delta_range[1])
-    if d_min < chunk_size:
-        raise ValueError(
-            f"delta_range lower bound {d_min} must be >= chunk_size {chunk_size} "
-            "so the action chunk cannot overshoot the goal"
-        )
+    if d_min < 0 or d_max < d_min:
+        raise ValueError(f"bad delta_range {delta_range}")
     occ_lo, occ_hi = float(goal_occupancy_range[0]), float(goal_occupancy_range[1])
 
     for pair_idx, pair in enumerate(accepted_pairs):
@@ -441,7 +557,7 @@ def iter_goal_start_windows(
             if og is None or not (occ_lo <= float(og) <= occ_hi):
                 continue
             if not _is_well_framed(
-                view_records[g].raw, min_goal_body_in_frame, require_goal_center_on_screen
+                view_records[g].raw, min_goal_visible_frac, require_goal_center_on_screen
             ):
                 continue
             for s in range(n):
@@ -451,18 +567,34 @@ def iter_goal_start_windows(
                 os_ = occupancy[s]
                 if os_ is None or float(os_) <= min_start_occupancy:
                     continue
-                direction = 1 if g > s else -1
-                if not (0 <= s + direction * chunk_size < n):
-                    continue                       # unreachable given delta >= chunk_size
                 pairs_sg.append((s, g))
 
         if max_per_pair and len(pairs_sg) > max_per_pair:
             rng = random.Random(f"{placement_dir.name}:{pair_idx}:{seed}")
-            pairs_sg = sorted(rng.sample(pairs_sg, max_per_pair))
+            # Stratify by distance rather than sampling the pool flat. Starts within a
+            # chunk of the goal vastly outnumber far ones (every g admits ~2*chunk_size
+            # of them), so a flat draw would make most of the data "already there,
+            # hold still" and the policy would learn to barely move.
+            near = [sg for sg in pairs_sg if abs(sg[1] - sg[0]) < chunk_size]
+            far = [sg for sg in pairs_sg if abs(sg[1] - sg[0]) >= chunk_size]
+            n_near = min(len(near), int(round(max_per_pair * float(near_fraction))))
+            n_far = min(len(far), max_per_pair - n_near)
+            n_near = min(len(near), max_per_pair - n_far)      # backfill if far is short
+            picked = rng.sample(near, n_near) + rng.sample(far, n_far)
+            pairs_sg = sorted(picked)
 
         for s, g in pairs_sg:
             direction = 1 if g > s else -1
-            keyframes = [view_records[s + direction * k] for k in range(chunk_size + 1)]
+            # Walk toward g and CLAMP there. When delta < chunk_size the remaining
+            # steps repeat the goal frame, so their action deltas are exactly zero —
+            # that is the "you have arrived, hold still" supervision the old
+            # delta >= chunk_size rule made impossible. The rule was meant to stop
+            # labels overshooting the goal; in a rollout the camera reaches within a
+            # chunk of the goal after a step or two and then has no idea what to do,
+            # which is the overshoot we measure (88% of held-out episodes).
+            idx = [s + direction * k for k in range(chunk_size + 1)]
+            idx = [min(i, g) if direction > 0 else max(i, g) for i in idx]
+            keyframes = [view_records[i] for i in idx]
             yield TrajectoryWindow(
                 annotation_path=data_json_path,
                 scene=keyframes[0].scene,

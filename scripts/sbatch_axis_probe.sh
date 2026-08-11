@@ -1,13 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=cleval
+#SBATCH --job-name=axprobe
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-gpu=8
 #SBATCH --mem=128G
-# 3h was sized for 12-24 episodes. A 160-episode sweep runs ~8h at ~3 min each, and
-# silently TIMED OUT at 63/160. Resume makes a restart cheap, but the limit should
-# not be the thing that decides how many episodes finish.
-#SBATCH --time=12:00:00
-#SBATCH --output=runs/cleval_%j.out
+#SBATCH --time=03:00:00
+#SBATCH --output=runs/axprobe_%j.out
 # Needs a C compiler for torch inductor (worker pods are driver-only), same as training.
 #SBATCH --container=nvcr.io/nvidia/cuda:12.8.0-devel-ubuntu22.04
 #
@@ -42,27 +39,4 @@ export IMAGINAIRE_OUTPUT_ROOT="${IMAGINAIRE_OUTPUT_ROOT:-$V12/runs/train}"
 export BASE_CHECKPOINT_PATH="${BASE_CHECKPOINT_PATH:-$CF/examples/checkpoints/Cosmos3-Nano}"
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 
-# Self-requeue on preemption. This eval takes ~4.5 h and `share` has been cutting it at
-# ~30 min, so without this it never finishes. Safe because closed_loop_eval resumes from
-# <out>.partial.json — each attempt continues rather than restarting.
-#
-# Three pitfalls the cluster guide warns about, all handled:
-#   - `exec` would replace this shell and destroy the trap  -> run python in background
-#   - a FOREGROUND child defers the handler until it exits  -> `&` + `wait`
-#   - `scancel` raises the same SIGTERM as a preemption      -> check sacct State first
-_args=("$@")
-_handle_term() {
-    state=$(sacct -j "$SLURM_JOB_ID" -X -n -P -o State 2>/dev/null | head -1)
-    case "$state" in
-        PREEMPTED*|*CANCELLED*by\ 0*)
-            echo "[requeue] preempted (state=$state) — resubmitting to finish the rest" >&2
-            sbatch -A share --qos=share "$0" "${_args[@]}" >&2
-            ;;
-        *) echo "[requeue] state=$state — not a preemption, exiting" >&2 ;;
-    esac
-    exit 143
-}
-trap _handle_term SIGTERM
-
-"$CF/.venv/bin/python" scripts/closed_loop_eval.py "$@" &
-wait $!
+exec "$CF/.venv/bin/python" scripts/axis_probe_eval.py "$@"

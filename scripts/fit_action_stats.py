@@ -32,9 +32,10 @@ from src.common.dataset_base import DEFAULT_EXCLUDE_OBJECTS, _compute_action_chu
 from src.common.facing import sector8
 from src.common.goal_space import DEFAULT_GOAL_KEYS, SUBJECT_BEARING_KEY, goal_vector
 from src.utils.rotation_utils import matrix_from_rot6d
+from src.common.dataset_base import DEFAULT_TRAJ_ROOT
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--root", default="data/trajectories")
+ap.add_argument("--root", default=DEFAULT_TRAJ_ROOT)
 ap.add_argument("--max-placements", type=int, default=150)
 ap.add_argument("--max-per-pair", type=int, default=12)
 ap.add_argument("--chunk-size", type=int, default=8)

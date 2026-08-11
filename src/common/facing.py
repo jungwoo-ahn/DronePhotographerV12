@@ -53,9 +53,22 @@ def front_azimuth(object_key: str, path: str | Path | None = None) -> float | No
 
 
 def subject_bearing_deg(
-    world_azimuth_deg: float, object_key: str, path: str | Path | None = None
+    world_azimuth_deg: float, object_key: str, path: str | Path | None = None,
+    *, yaw_deg: float = 0.0,
 ) -> float | None:
     """World-frame `cam_to_obj_azimuth_deg` -> subject-frame bearing in [0, 360).
+
+    `yaw_deg` is the placement's subject rotation (`placement_yaw_deg`), and it is
+    applied HERE rather than to the azimuth. Spinning the subject does not move the
+    camera, so the world azimuth is identical before and after a yaw re-render —
+    verified on real data: a placement re-rendered at yaw 310.86 deg scored the same
+    azimuth (26 deg) as the original. What the spin changes is where the subject's
+    front points:
+
+        effective_front_az = front_az[asset] + placement_yaw_deg
+
+    Omitting it makes a yaw re-render a no-op in goal space: the frames show a rotated
+    subject while every bearing stays exactly as it was.
 
     Returns None when the object has no facing entry, so callers can drop the sample
     rather than silently fall back to the (ambiguous) world angle.
@@ -63,18 +76,23 @@ def subject_bearing_deg(
     front = front_azimuth(object_key, path)
     if front is None or world_azimuth_deg is None or not math.isfinite(world_azimuth_deg):
         return None
-    return (front - float(world_azimuth_deg)) % 360.0
+    return (front + float(yaw_deg) - float(world_azimuth_deg)) % 360.0
 
 
 def world_azimuth_deg(
-    bearing_deg: float, object_key: str, path: str | Path | None = None
+    bearing_deg: float, object_key: str, path: str | Path | None = None,
+    *, yaw_deg: float = 0.0,
 ) -> float | None:
     """Inverse of `subject_bearing_deg` — needed to score a bearing goal against a
-    world-frame achieved profile (eval / rollout)."""
+    world-frame achieved profile (eval / rollout).
+
+    Takes the same `yaw_deg`; a one-sided fix would silently break round-tripping on
+    re-rendered placements, which is where the eval scores its goals.
+    """
     front = front_azimuth(object_key, path)
     if front is None or bearing_deg is None or not math.isfinite(bearing_deg):
         return None
-    return (front - float(bearing_deg)) % 360.0
+    return (front + float(yaw_deg) - float(bearing_deg)) % 360.0
 
 
 SECTOR8 = (

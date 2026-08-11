@@ -6,8 +6,9 @@ Self-contained; .venv-analysis. Reads runs/facing_auto_full.json + data. Writes 
 import os, json, base64, io
 os.chdir("/home/nas_main/jungwooahn/projects/DronePhotographerV12")
 from PIL import Image
+from src.common.dataset_base import DEFAULT_TRAJ_ROOT
 
-ROOT = "data/trajectories"
+ROOT = DEFAULT_TRAJ_ROOT
 AUTO = json.load(open("runs/facing_auto_full.json"))
 OUT  = "runs/facing_verify.html"
 

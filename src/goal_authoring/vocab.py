@@ -57,6 +57,34 @@ PLACE_Y: dict[str, tuple[float, float, float]] = {
     "lower": (0.62, 1.0, 0.81),
     "off-screen bottom": (1.0, 9.0, 1.12),
 }
+# --- CROP SIDE  (which END of the subject the frame cuts) ---
+# Two keys, not one, so this axis deliberately stays OUT of AXIS_KEY: that table is 1:1
+# axis->key and drives `is_partial()`'s six-key contract. The labels must match
+# `src.data.lerobot_export.crop_phrase` exactly, or an authored goal and a training goal
+# describing the same framing would produce different sentences.
+# Values are (top_cut_frac, bot_cut_frac) centroids chosen so `crop_phrase` reproduces the
+# label verbatim (it cuts at 0.02 for "is it cut" and 0.35 for legs-vs-waist).
+CROP_SIDE: dict[str, tuple[float, float]] = {
+    "uncropped": (0.0, 0.0),
+    "cropped at the legs": (0.0, 0.20),
+    "cropped below the waist": (0.0, 0.50),
+    "cropped above the head": (0.30, 0.0),
+    "cropped at both the head and the feet": (0.30, 0.30),
+}
+
+
+def crop_label(top_cut_frac: float, bot_cut_frac: float) -> str:
+    """(top, bot) fractions -> the same word `crop_phrase` would emit."""
+    top, bot = float(top_cut_frac) > 0.02, float(bot_cut_frac) > 0.02
+    if top and bot:
+        return "cropped at both the head and the feet"
+    if top:
+        return "cropped above the head"
+    if bot:
+        return "cropped below the waist" if float(bot_cut_frac) > 0.35 else "cropped at the legs"
+    return "uncropped"
+
+
 # coarse subject-relative bearing centroids (when the user says only "front/side/back")
 SECTOR3_CENTROID: dict[str, float] = {"front": 0.0, "side": 90.0, "back": 180.0}
 
@@ -104,6 +132,9 @@ def profile_to_categories(profile: Mapping[str, float]) -> dict[str, str]:
         cats["placement_x"] = _classify(float(profile["object_center_x"]) / RENDER_WIDTH, PLACE_X)
     if "object_center_y" in profile:
         cats["placement_y"] = _classify(float(profile["object_center_y"]) / RENDER_HEIGHT, PLACE_Y)
+    if "top_cut_frac" in profile or "bot_cut_frac" in profile:
+        cats["crop_side"] = crop_label(profile.get("top_cut_frac", 0.0),
+                                       profile.get("bot_cut_frac", 0.0))
     return cats
 
 
@@ -124,6 +155,12 @@ def categories_to_profile(cats: Mapping[str, str]) -> tuple[dict[str, float], fr
         vals["object_center_x"] = PLACE_X[cats["placement_x"]][2] * RENDER_WIDTH
     if "placement_y" in cats:
         vals["object_center_y"] = PLACE_Y[cats["placement_y"]][2] * RENDER_HEIGHT
+    if "crop_side" in cats:
+        t, b = CROP_SIDE[cats["crop_side"]]
+        vals["top_cut_frac"], vals["bot_cut_frac"] = t, b
+        vals["head_in_frame"] = 0.0 if t > 0.02 else 1.0
+        if t <= 0.02 and b <= 0.02:
+            vals["visible_frac"] = 1.0        # only knowable when nothing is cut
     return vals, frozenset(vals)
 
 

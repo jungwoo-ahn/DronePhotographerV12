@@ -7,6 +7,9 @@ os.chdir("/home/nas_main/jungwooahn/projects/DronePhotographerV12")
 import numpy as np
 from PIL import Image
 
+from src.common.annotations import is_goal_frame
+from src.common.dataset_base import DEFAULT_TRAJ_ROOT
+
 ap = argparse.ArgumentParser()
 ap.add_argument("--max-assets", type=int, default=8)
 ap.add_argument("--views", type=int, default=8)         # frames shown per asset (spread over azimuth)
@@ -14,7 +17,7 @@ ap.add_argument("--model", default="Qwen/Qwen2.5-VL-7B-Instruct")
 ap.add_argument("--out", default="runs/facing_map.json")
 args = ap.parse_args()
 
-ROOT = "data/trajectories"
+ROOT = DEFAULT_TRAJ_ROOT
 dirs = [d for d in os.listdir(ROOT) if os.path.isdir(os.path.join(ROOT, d))]
 by_obj = {}
 for d in sorted(dirs):
@@ -30,7 +33,7 @@ def pick_views(dn, k):
         for r in pair:
             s = r.get("scores")
             if not s or not r.get("in_frame"): continue
-            if not (30 <= s["occupancy"] <= 90 and s["body_in_frame_ratio"] >= 45): continue
+            if not is_goal_frame(r): continue
             cand.append((s["cam_to_obj_azimuth_deg"], os.path.join(ROOT, dn, r["path_rel"]), r.get("bbox_xyxy_full")))
     if len(cand) < 3: return []
     # one frame per azimuth sector, spread around the circle

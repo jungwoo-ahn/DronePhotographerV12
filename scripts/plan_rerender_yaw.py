@@ -32,11 +32,28 @@ os.chdir("/home/nas_main/jungwooahn/projects/DronePhotographerV12")
 
 import numpy as np
 
-from src.common.annotations import _is_well_framed
+from src.common.annotations import _apply_crop_extent, _is_well_framed
 from src.common.dataset_base import DEFAULT_EXCLUDE_OBJECTS
 from src.common.facing import front_azimuth, sector8
 
+
+def _framed_raw(record: dict) -> dict:
+    """scores + the crop keys `_is_well_framed` actually gates on.
+
+    The on-disk `scores` dict has no `visible_frac` — only the signed `bbox_xyxy_full` sitting
+    beside it does — so passing `scores` straight in silently fell back to an area ratio.
+    """
+    raw = dict(record.get("scores") or {})
+    bbox = record.get("bbox_xyxy_full")
+    if bbox:
+        _apply_crop_extent(raw, bbox, float(RENDER_HEIGHT))
+    return raw
+
+
 ap = argparse.ArgumentParser()
+# Deliberately the PRE-re-render tree: this script exists to measure what the
+# re-render changed, so it must read the superseded renders. Everything that
+# consumes current data uses dataset_base.DEFAULT_TRAJ_ROOT.
 ap.add_argument("--root", default="data/trajectories")
 ap.add_argument("--out", default="runs/yaw_plan.json")
 ap.add_argument("--n-placements", type=int, default=300, help="how many to re-render")
@@ -85,7 +102,7 @@ for dn in dirs:
         r["scores"]["cam_to_obj_azimuth_deg"]
         for rec in (doc.get("render_records") or [])
         for r in rec
-        if r.get("scores") and _is_well_framed(r["scores"], 70.0, True)
+        if r.get("scores") and _is_well_framed(_framed_raw(r), 0.35)
         and 20.0 <= r["scores"]["occupancy"] <= 80.0
     ]
     if len(azs) < args.min_frames:

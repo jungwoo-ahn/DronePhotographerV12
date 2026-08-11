@@ -30,6 +30,9 @@ ap.add_argument("--closed-loop", nargs="*",
                 default=["runs/closed_loop/back_iter8000.json",
                          "runs/closed_loop/all_iter8000.json"])
 ap.add_argument("--thumb", type=int, default=190, help="embedded frame width in px")
+ap.add_argument("--cl-thumb", type=int, default=150,
+                help="frame width for closed-loop sheets; they dominate page "
+                     "weight when every episode is shown")
 ap.add_argument("--quality", type=int, default=72)
 ap.add_argument("--title", default="Camera Policy — Evaluation Report")
 ap.add_argument("--out", default="runs/report/eval_report.html")
@@ -276,7 +279,21 @@ def test_a_gallery(eps: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------- contact sheet
-def contact_sheet(ep: dict, thumb: int) -> str:
+def frames_trustworthy(run: dict) -> bool:
+    """Whether this run's saved frames can be attributed to it.
+
+    Runs before the fix wrote into a shared `frames/` directory named only by
+    episode index, so two runs in the same output directory overwrote each other's
+    images — the numbers stayed correct (they come from env poses) but a strip could
+    show two different scenes. Those runs cannot be repaired after the fact, so the
+    report refuses to display their frames rather than showing a plausible lie.
+    A run that declares `frames_dir` is namespaced by its own output file.
+    """
+    return bool((run.get("summary") or {}).get("frames_dir")
+                or run.get("frames_dir"))
+
+
+def contact_sheet(ep: dict, thumb: int, show_frames: bool = True) -> str:
     """One episode as a filmstrip: start, each rollout step, then the goal apart.
 
     A contact sheet is how this gets judged in the end — the numbers say the camera
@@ -286,13 +303,14 @@ def contact_sheet(ep: dict, thumb: int) -> str:
     shots = b.get("shots") or ep.get("shots") or []
     cells = []
     for s in shots:
-        uri = data_uri(s.get("path"), thumb)
+        uri = data_uri(s.get("path"), thumb) if show_frames else None
         tag = s.get("tag", "")
         d = s.get("d")
         label = t("시작", "start") if tag == "start" else tag.replace("chunk", "+")
         cells.append(f"""<figure class="frame">
   {'<img src="' + uri + '" alt="' + tag + '" loading="lazy">' if uri
-   else '<div class="frame-missing">—</div>'}
+   else ('<div class="frame-missing" title="frame not attributable to this run">?</div>'
+         if not show_frames else '<div class="frame-missing">—</div>')}
   <figcaption><span class="ftag">{label}</span>
     {'<span class="fd">' + f'{d:.3f}' + '</span>' if isinstance(d, (int, float)) else ''}
   </figcaption>
@@ -341,6 +359,12 @@ def contact_sheet(ep: dict, thumb: int) -> str:
     <div class="ep-stats">{stats}{badge}</div>
   </header>
   {a_html}
+  {'' if show_frames else '<p class="ep-note warnnote">' + t(
+     "이 실행의 저장 프레임은 다른 실행에 덮어써져 이 에피소드의 것이라고 보장할 수 없어 숨겼습니다. "
+     "아래 거리 수치는 카메라 포즈에서 계산된 것이라 영향이 없습니다.",
+     "Saved frames for this run were overwritten by another run and cannot be attributed to "
+     "this episode, so they are hidden. The distances below come from camera poses and are "
+     "unaffected.") + '</p>'}
   <div class="strip">
     <div class="strip-run">{''.join(cells)}</div>
     <div class="strip-goal">{goal_cell}</div>
@@ -539,6 +563,13 @@ td.delta{font-weight:650}
 td.delta.good{color:var(--good)} td.delta.warn{color:var(--warn)}
 td.delta.flat{color:var(--muted)}
 td .muted{color:var(--muted);font-weight:400;font-size:11px}
+.scatter{width:100%;max-width:620px;height:auto;margin:12px 0}
+.sc{fill:var(--accent);opacity:.82;stroke:var(--surface);stroke-width:1}
+.sc.neg{fill:var(--warn)}
+.zeroline{stroke:var(--ink-2);stroke-width:1.5}
+.splitline{stroke:var(--line);stroke-width:1;stroke-dasharray:3 3}
+.meanline{stroke:var(--good);stroke-width:2;stroke-dasharray:6 3}
+.warnnote{color:var(--warn);font-size:11.5px;margin:0 0 8px;max-width:none}
 .callout{border-left:3px solid var(--accent);background:var(--surface);
   border-radius:0 10px 10px 0;padding:14px 18px;margin:18px 0;box-shadow:var(--shadow)}
 .callout.warn{border-left-color:var(--warn)}
@@ -626,8 +657,10 @@ def render(gt_runs: list[dict], cl_runs: list[dict]) -> str:
 <th>{t("시작","start")}</th><th>{t("종료","end")}</th><th>{t("최저","best")}</th>
 <th>{t("개선","improve")}</th></tr></thead><tbody>{rows}</tbody></table></div>"""
 
-    gt_sheets = "".join(contact_sheet(e, args.thumb) for e in gt_eps)
-    cl_sheets = "".join(contact_sheet(e, 150) for e in cl_eps if e.get("shots"))
+    gt_ok = bool(newest and frames_trustworthy(newest))
+    gt_sheets = "".join(contact_sheet(e, args.thumb, gt_ok) for e in gt_eps)
+    cl_ok = all(frames_trustworthy(r) for r in cl_runs) if cl_runs else False
+    cl_sheets = "".join(contact_sheet(e, args.cl_thumb, cl_ok) for e in cl_eps if e.get("shots"))
 
     TITLE = args.title
     return f"""<title>{TITLE}</title>
@@ -643,16 +676,19 @@ def render(gt_runs: list[dict], cl_runs: list[dict]) -> str:
   <h1>{t("목표 조건부 카메라 정책 — 평가 보고서",
           "Goal-conditioned camera policy — evaluation report")}</h1>
   <p class="lede">{t(
-    "학습한 궤적을 재현하는가(테스트 A·B), 그리고 처음 보는 배치에서 목표 구도에 도달하는가"
-    "(closed-loop). 모든 프레임은 Blender에서 실제로 렌더링된 것입니다.",
-    "Does the policy reproduce trajectories it was trained on (tests A and B), and does it "
-    "reach the requested framing on placements it has never seen (closed-loop)? Every frame "
-    "here was actually rendered in Blender.")}</p>
+    "학습한 궤적을 재현하는가(테스트 A·B), 그리고 롤아웃으로 목표 구도에 도달하는가"
+    "(closed-loop). 각 절이 학습 배치에서 쟀는지 처음 보는 배치에서 쟀는지는 절마다 명시합니다. "
+    "모든 프레임은 Blender에서 실제로 렌더링된 것입니다.",
+    "Does the policy reproduce trajectories it was trained on (tests A and B), and does a "
+    "rollout reach the requested framing (closed-loop)? Each section states whether it was "
+    "measured on trained or unseen placements. Every frame here was actually rendered in "
+    "Blender.")}</p>
 </header>
 
 <div class="tiles">{tiles_html}</div>
 
 {compare_section(gt_runs)}
+{rollout_compare(cl_runs)}
 
 <h2>{t("무엇을 쟀는가", "What was measured")}</h2>
 <p class="sub">{t(
@@ -694,11 +730,18 @@ def render(gt_runs: list[dict], cl_runs: list[dict]) -> str:
   "approach and <span style='color:var(--warn)'>●</span> where it ended up.")}</p>
 {gt_sheets or '<p class="sub">' + t("아직 결과 없음", "no results yet") + '</p>'}
 
-<h2>{t("처음 보는 배치 — closed-loop", "Held-out placements — closed loop")}</h2>
-<p class="sub">{t(
-  "학습에 쓰이지 않은 배치. 데이터가 뒷모습에 치우쳐 있어 back 계열부터 확인했습니다.",
-  "Placements never used in training. The data is back-heavy, so the back sectors were "
-  "checked first.")}</p>
+{closed_loop_header(cl_runs)}
+{("<h3>" + t("시작 거리에 따른 개선 — 오버슈트의 형태",
+                     "Improvement by starting distance — the shape of the overshoot") + "</h3>"
+   + "<p class=\"sub\">" + t(
+     "점 하나가 에피소드 하나. 가로선은 각 구간의 평균입니다. 멀리서 시작하면 크게 개선하지만 "
+     "이미 가까우면 거의 못 벌고 때때로 손해를 봅니다 — 평균 하나로는 완전히 가려지는 차이이고, "
+     "‘정책이 약하다’와 ‘정책이 멈추지 못한다’를 가르는 지점입니다.",
+     "One point per episode; the horizontal rules are per-band means. From far away the "
+     "policy gains a lot; when it starts near the goal it gains almost nothing and "
+     "sometimes loses ground — a distinction a single mean erases, and the one that "
+     "separates ‘the policy is weak’ from ‘the policy cannot hold still’.") + "</p>"
+   + start_vs_improvement(cl_eps)) if cl_eps else ""}
 {sector_bars}
 {cl_table}
 {cl_sheets}
@@ -788,9 +831,181 @@ def finding_section(gt_eps: list[dict], cl_eps: list[dict]) -> str:
   "'you are there, now hold still', so the policy has no way to learn it.")}</p></div>"""
 
 
+def start_vs_improvement(eps: list[dict], width: int = 620, height: int = 300) -> str:
+    """Improvement against how far the camera started from the goal.
+
+    This is where the overshoot shows its shape. Aggregated over all episodes the
+    policy looks useful; split by starting distance it turns out to help a lot from
+    far away and barely at all — sometimes negatively — when it starts near the
+    goal. A single mean hides that completely, and it is the difference between
+    "the policy is weak" and "the policy cannot hold still".
+    """
+    pts = [(float(e["d_start"]), float(e.get("improvement", 0.0)), e.get("sector", ""))
+           for e in eps if "d_start" in e]
+    if len(pts) < 4:
+        return ""
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    x0, x1 = 0.0, max(xs) * 1.08
+    y0, y1 = min(min(ys), 0.0) * 1.15, max(ys) * 1.12
+    pad_l, pad_r, pad_t, pad_b = 54, 14, 14, 40
+    w, h = width - pad_l - pad_r, height - pad_t - pad_b
+
+    def T(x, y):
+        return (pad_l + (x - x0) / (x1 - x0) * w,
+                pad_t + h - (y - y0) / (y1 - y0) * h)
+
+    zx0, zy = T(x0, 0.0)
+    zx1, _ = T(x1, 0.0)
+    # split marker at the boundary used in the copy
+    sx, _ = T(0.6, 0.0)
+    dots = "".join(
+        f'<circle cx="{X:.1f}" cy="{Y:.1f}" r="4.2" '
+        f'class="sc {"neg" if y < 0 else "pos"}"><title>{s} · start {x:.3f} · '
+        f'improvement {y:+.3f}</title></circle>'
+        for (x, y, s), (X, Y) in ((p, T(p[0], p[1])) for p in pts))
+
+    def group(lo, hi):
+        g = [y for x, y, _ in pts if lo <= x < hi]
+        return (sum(g) / len(g), len(g)) if g else (0.0, 0)
+
+    near, n_near = group(0.0, 0.6)
+    far, n_far = group(0.6, 1e9)
+    nX, nY = T(0.3, near)
+    fX, fY = T(max(xs) * 0.8, far)
+
+    yticks = "".join(
+        f'<line x1="{pad_l}" y1="{T(x0, v)[1]:.1f}" x2="{width-pad_r}" y2="{T(x0, v)[1]:.1f}" '
+        f'class="se-grid"/><text x="{pad_l-8}" y="{T(x0, v)[1]+3.4:.1f}" class="axlab" '
+        f'text-anchor="end">{v:+.1f}</text>'
+        for v in (round(y0, 1), 0.0, round(y1, 1)) if y0 <= v <= y1)
+    return f"""<svg viewBox="0 0 {width} {height}" class="scatter" role="img"
+  aria-label="improvement versus starting distance to the goal, one point per episode">
+  {yticks}
+  <line x1="{zx0:.1f}" y1="{zy:.1f}" x2="{zx1:.1f}" y2="{zy:.1f}" class="zeroline"/>
+  <line x1="{sx:.1f}" y1="{pad_t}" x2="{sx:.1f}" y2="{pad_t+h}" class="splitline"/>
+  {dots}
+  <line x1="{pad_l}" y1="{nY:.1f}" x2="{sx:.1f}" y2="{nY:.1f}" class="meanline"/>
+  <line x1="{sx:.1f}" y1="{fY:.1f}" x2="{width-pad_r}" y2="{fY:.1f}" class="meanline"/>
+  <text x="{nX:.1f}" y="{nY-7:.1f}" class="axlab" text-anchor="middle">{near:+.3f} (n={n_near})</text>
+  <text x="{fX:.1f}" y="{fY-7:.1f}" class="axlab" text-anchor="middle">{far:+.3f} (n={n_far})</text>
+  <text x="{pad_l}" y="{height-12}" class="axlab">{t("시작 거리 0","start distance 0")}</text>
+  <text x="{sx:.1f}" y="{height-12}" class="axlab" text-anchor="middle">0.6</text>
+  <text x="{width-pad_r}" y="{height-12}" class="axlab" text-anchor="end">{max(xs):.2f}</text>
+  <text x="14" y="{pad_t+h/2:.1f}" class="axlab" text-anchor="middle"
+    transform="rotate(-90 14 {pad_t+h/2:.1f})">{t("개선","improvement")}</text>
+</svg>"""
+
+
+def closed_loop_header(runs: list[dict]) -> str:
+    """Section heading that reads the guarantee off the data instead of asserting it.
+
+    This used to be a hardcoded "placements never used in training". It was wrong:
+    the export consumes 4 episodes from each of only ~1000 placements, and the eval
+    drew from the same shuffled directory listing, so all 12 evaluated placements
+    were trained-on. The label is now derived from `summary.held_out_only`, which
+    the eval writes only when it actually excluded the trained set — a run that
+    predates the flag reports the weaker claim rather than the flattering one.
+    """
+    if not runs:
+        return (f'<h2>{t("롤아웃 — closed-loop", "Rollout — closed loop")}</h2>'
+                f'<p class="sub">{t("결과 대기 중.", "Results pending.")}</p>')
+    held = [bool((r.get("summary") or {}).get("held_out_only")) for r in runs]
+    if all(held):
+        return f"""<h2>{t("처음 보는 배치 — closed-loop", "Held-out placements — closed loop")}</h2>
+<p class="sub">{t(
+  "학습에 한 번도 쓰이지 않은 배치. 평가 시작 시 export 열거를 재현해 학습에 쓰인 배치를 "
+  "제외한 뒤 뽑았습니다.",
+  "Placements never used in training. The eval replays the export enumeration at start-up "
+  "and draws only from what it did not consume.")}</p>"""
+    return f"""<h2>{t("학습에 쓰인 배치 — closed-loop", "Trained-on placements — closed loop")}</h2>
+<div class="callout warn"><p>{t(
+  "<b>이 절은 일반화 측정이 아닙니다.</b> 이 실행은 학습에 쓰인 배치에서 롤아웃했습니다. "
+  "export 는 배치당 4 에피소드씩 약 1,000개 배치만 소비하는데, 평가가 같은 디렉터리를 같은 "
+  "시드로 섞어 앞에서부터 뽑아 정확히 그 안에 떨어졌습니다 — 검사 결과 12/12 전부 학습 배치였습니다.",
+  "<b>This section is not a generalization measurement.</b> This run rolled out on "
+  "placements the model trained on. The export consumes only ~1000 placements (4 episodes "
+  "each), and the eval drew from the same shuffled listing with the same seed, landing "
+  "inside that set — a check found 12 of 12 evaluated placements were trained-on.")}</p>
+<p>{t(
+  "학습 배치에서의 도달 성능으로는 여전히 유효하며, 아래 오버슈트 패턴도 그대로 유효합니다. "
+  "다만 처음 보는 장면에 대한 주장으로는 읽으면 안 됩니다. 수정된 실행이 진행 중입니다.",
+  "It remains valid as attainment on trained placements, and the overshoot pattern below "
+  "still holds. It must not be read as a claim about unseen scenes. A corrected run is "
+  "in progress.")}</p></div>"""
+
+
 def _ckpt_label(run: dict) -> str:
     m = re.search(r"iter_0*(\d+)", str(run.get("checkpoint", "")))
     return f"iter {int(m.group(1)):,}" if m else Path(str(run.get("path", "?"))).stem
+
+
+def rollout_compare(runs: list[dict]) -> str:
+    """Closed-loop metrics for several checkpoints side by side.
+
+    The question this answers is not "did the loss go down" — held-out loss already says
+    yes — but whether the checkpoint that minimises it is the one that actually reaches
+    the shot. v11 found those can disagree, so they are measured separately and shown
+    together.
+    """
+    rows = []
+    for r in runs:
+        eps = r.get("results") or r.get("episodes") or []
+        eps = [e for e in eps if "d_start" in e]
+        if not eps:
+            continue
+        n = len(eps)
+        made = sum(e["d_start"] - e["d_best"] for e in eps)
+        kept = sum(e["d_start"] - e["d_end"] for e in eps)
+        near = [e for e in eps if e["d_start"] < 0.6]
+        far = [e for e in eps if e["d_start"] >= 0.6]
+        rows.append({
+            "label": _ckpt_label(r),
+            "n": n,
+            "kept": kept / n,
+            "made": made / n,
+            "given_back": (made - kept) / made if made > 1e-9 else 0.0,
+            "overshoot": sum(1 for e in eps
+                             if e["d_end"] > e["d_best"] + 0.05) / n,
+            "near": (sum(e["improvement"] for e in near) / len(near)) if near else None,
+            "far": (sum(e["improvement"] for e in far) / len(far)) if far else None,
+            "partial": bool((r.get("summary") or {}).get("partial")),
+        })
+    if not rows:
+        return ""
+    rows.sort(key=lambda x: x["label"])
+    heads = "".join(
+        f"<th>{r['label']}{' *' if r['partial'] else ''}</th>" for r in rows)
+    def line(lbl, key, fmt, better_high=True):
+        vals = [r[key] for r in rows]
+        if any(v is None for v in vals):
+            return ""
+        best = max(vals) if better_high else min(vals)
+        cells = "".join(
+            f'<td class="num{" delta good" if v == best else ""}">{fmt.format(v)}</td>'
+            for v in vals)
+        return f"<tr><td>{lbl}</td>{cells}</tr>"
+    body = "".join([
+        f"<tr><td>{t('에피소드','episodes')}</td>"
+        + "".join(f'<td class="num">{r["n"]}</td>' for r in rows) + "</tr>",
+        line(t("평균 개선", "mean improvement"), "kept", "{:+.4f}", True),
+        line(t("최대 개선", "best improvement"), "made", "{:+.4f}", True),
+        line(t("되돌려준 성과", "progress given back"), "given_back", "{:.0%}", False),
+        line(t("오버슈트", "overshoot rate"), "overshoot", "{:.0%}", False),
+        line(t("가까이 시작 (<0.6)", "starts near (<0.6)"), "near", "{:+.3f}", True),
+        line(t("멀리 시작 (>=0.6)", "starts far (>=0.6)"), "far", "{:+.3f}", True),
+    ])
+    note = ""
+    if any(r["partial"] for r in rows):
+        note = ("<p class=\"sub\">" + t(
+            "* 진행 중인 실행입니다. 에피소드가 섹터 순서대로 채워지므로 <b>섹터별 수치는 "
+            "아직 비교하면 안 됩니다</b>; 전체 평균은 유효합니다.",
+            "* still running. Episodes fill in sector order, so <b>per-sector numbers are "
+            "not yet comparable</b>; the overall means are.") + "</p>")
+    return f"""<h2>{t("체크포인트별 도달 성능", "Goal attainment by checkpoint")}</h2>
+<div class="tablewrap"><table class="cmp">
+<thead><tr><th>{t("지표","metric")}</th>{heads}</tr></thead><tbody>{body}</tbody></table></div>
+{note}"""
 
 
 def compare_section(runs: list[dict]) -> str:

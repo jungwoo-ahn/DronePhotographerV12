@@ -9,13 +9,15 @@ sys.path.insert(0, "/home/nas_main/jungwooahn/projects/DronePhotographerV12")
 os.chdir("/home/nas_main/jungwooahn/projects/DronePhotographerV12")
 import numpy as np
 
+from src.common.annotations import is_goal_frame
 from src.common.facing import front_azimuth, sector3, sector8
 from src.goal_authoring import vocab
 from src.goal_authoring.from_reference import ReferenceEstimator
 from src.scoring.bbox_control import compute_v5_scores
+from src.common.dataset_base import DEFAULT_TRAJ_ROOT
 
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 200
-ROOT = "data/trajectories"
+ROOT = DEFAULT_TRAJ_ROOT
 est = ReferenceEstimator()
 
 dirs = [d for d in os.listdir(ROOT) if os.path.isdir(os.path.join(ROOT, d))]
@@ -32,7 +34,7 @@ for dn in dirs:
     except Exception: continue
     W, H = d.get("render_width", 1024), d.get("render_height", 768)
     cand = [(r, s) for pair in d.get("render_records", []) for r in pair
-            if (s := r.get("scores")) and r.get("in_frame") and 30 <= s["occupancy"] <= 92 and s["body_in_frame_ratio"] >= 45]
+            if is_goal_frame(r)]
     if not cand: continue
     r, s = random.choice(cand)
     bb = r.get("bbox_xyxy_full")

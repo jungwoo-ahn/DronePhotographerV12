@@ -12,6 +12,7 @@ os.chdir("/home/nas_main/jungwooahn/projects/DronePhotographerV12")
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+from src.common.annotations import is_goal_frame
 from src.common.facing import front_azimuth, sector3, sector8
 from src.common.goal_space import DEFAULT_V5_RANGES, SUBJECT_BEARING_KEY, CYCLIC_GOAL_KEYS
 from src.goal_authoring import vocab
@@ -19,8 +20,9 @@ from src.goal_authoring.goal_profile import GoalProfile
 from src.goal_authoring.from_language import keyword_classifier, language_to_goal
 from src.goal_authoring.from_reference import ReferenceEstimator
 from src.scoring.bbox_control import compute_v5_scores
+from src.common.dataset_base import DEFAULT_TRAJ_ROOT
 
-ROOT = "data/trajectories"
+ROOT = DEFAULT_TRAJ_ROOT
 OUT = "runs/goal_authoring_report.html"
 
 # ============================ MODULE 1: NL -> goal ============================
@@ -160,7 +162,7 @@ def main():
             for r in pair:
                 s = r.get("scores"); bb = r.get("bbox_xyxy_full")
                 if not s or not r.get("in_frame") or not bb: continue
-                if not (30 <= s["occupancy"] <= 92 and s["body_in_frame_ratio"] >= 45): continue
+                if not is_goal_frame(r): continue
                 gt = visible_gt(bb, W, H, s["cam_to_obj_azimuth_deg"], s["cam_to_obj_elevation_deg"])
                 gt["occupancy"] = s["occupancy"]
                 gt[SUBJECT_BEARING_KEY] = (front_azimuth(obj) - s["cam_to_obj_azimuth_deg"]) % 360

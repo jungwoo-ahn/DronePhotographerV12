@@ -7,8 +7,10 @@ sys.path.insert(0, "/home/nas_main/jungwooahn/projects/DronePhotographerV12")
 os.chdir("/home/nas_main/jungwooahn/projects/DronePhotographerV12")
 import numpy as np
 
+from src.common.annotations import is_goal_frame
 from src.common.facing import front_azimuth, sector3, sector8
 from src.goal_authoring.pose_bearing import BearingModel, pose_features
+from src.common.dataset_base import DEFAULT_TRAJ_ROOT
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--pose-model", default="yolo11l-pose.pt")
@@ -19,7 +21,7 @@ ap.add_argument("--cache", default="runs/bearing_feats.npz")
 ap.add_argument("--refresh", action="store_true")
 args = ap.parse_args()
 
-ROOT = "data/trajectories"
+ROOT = DEFAULT_TRAJ_ROOT
 
 
 def iou(a, b):
@@ -44,7 +46,7 @@ def extract():
         try: d = json.load(open(os.path.join(ROOT, dn, "data.json")))
         except Exception: continue
         cand = [(r, s) for pair in d.get("render_records", []) for r in pair
-                if (s := r.get("scores")) and r.get("in_frame") and 30 <= s["occupancy"] <= 92 and s["body_in_frame_ratio"] >= 45]
+                if is_goal_frame(r)]
         if not cand: continue
         r, s = random.choice(cand); n += 1
         gt = (front_azimuth(obj) - s["cam_to_obj_azimuth_deg"]) % 360

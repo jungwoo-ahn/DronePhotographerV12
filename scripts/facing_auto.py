@@ -5,6 +5,7 @@ because it aggregates hundreds of frames (per-frame noise averages out) with a p
 Emits a confidence per asset so the low-confidence tail can be human-verified.
 Self-contained; .venv-analysis (cv2 CPU). Writes runs/facing_auto.json."""
 import os, json, math, random, argparse
+from src.common.dataset_base import DEFAULT_TRAJ_ROOT
 os.chdir("/home/nas_main/jungwooahn/projects/DronePhotographerV12")
 import numpy as np, cv2
 
@@ -14,7 +15,7 @@ ap.add_argument("--max-frames", type=int, default=250)     # per asset cap
 ap.add_argument("--out", default="runs/facing_auto.json")
 args = ap.parse_args()
 
-ROOT = "data/trajectories"
+ROOT = DEFAULT_TRAJ_ROOT
 det = cv2.FaceDetectorYN.create("assets/models/yunet_2023mar.onnx", "", (320,320), 0.4, 0.3, 50)
 
 dirs = [d for d in os.listdir(ROOT) if os.path.isdir(os.path.join(ROOT, d))]

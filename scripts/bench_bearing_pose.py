@@ -11,9 +11,11 @@ if not hasattr(cv2, "imshow"):
     cv2.imshow = lambda *a, **k: None
 from ultralytics import YOLO
 
+from src.common.annotations import is_goal_frame
 from src.common.facing import front_azimuth, sector3, sector8
+from src.common.dataset_base import DEFAULT_TRAJ_ROOT
 
-ROOT = "data/trajectories"
+ROOT = DEFAULT_TRAJ_ROOT
 model = YOLO("yolo11l-pose.pt")
 
 # ---- collect GT samples (one frame per placement, subject visible, GT bearing known) ----
@@ -27,7 +29,7 @@ for dn in dirs:
     try: d = json.load(open(os.path.join(ROOT, dn, "data.json")))
     except Exception: continue
     cand = [(r, s) for pair in d.get("render_records", []) for r in pair
-            if (s := r.get("scores")) and r.get("in_frame") and 30 <= s["occupancy"] <= 92 and s["body_in_frame_ratio"] >= 45]
+            if is_goal_frame(r)]
     if not cand: continue
     r, s = random.choice(cand)
     gt = (front_azimuth(obj) - s["cam_to_obj_azimuth_deg"]) % 360
