@@ -117,6 +117,7 @@ from src.common.goal_space import (  # noqa: E402
 )
 from src.common.reward import pose_to_geometry, _geometry_distance  # noqa: E402
 from src.common.run_info import write_run_info  # noqa: E402
+from src.data.cosmos_camera_dataset import CAMERA_ACTION_DIM  # noqa: E402
 from src.data.lerobot_export import goal_prompt  # noqa: E402
 from src.utils.rotation_utils import matrix_from_rot6d  # noqa: E402
 
@@ -277,7 +278,7 @@ def predict_chunks(model, frame_uint8: np.ndarray, prompt: str, seed: int,
         batch = build_action_batch(
             video=video.clone(),
             action=torch.zeros(args.chunk_size, 64, dtype=torch.float32),
-            raw_action_dim=9, prompt=prompt, view_point="ego_view",
+            raw_action_dim=CAMERA_ACTION_DIM, prompt=prompt, view_point="ego_view",
             # ModelMode, not "policy": the builder reads `model_mode.value`, and the
             # StrEnum compares equal to the string so nothing catches it earlier.
             domain_name="camera_pose", model_mode=ModelMode.POLICY,

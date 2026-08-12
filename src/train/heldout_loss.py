@@ -65,10 +65,14 @@ class HeldOutLossProbe(Callback):
         seed: int = 1234,
         loss_key: str = "flow_matching_loss_action",
     ) -> None:
-        # `num_batches` default 2, not 4: the val split is 200 episodes and sequence
-        # packing turns that into exactly 2 batches per epoch. Asking for more used to
-        # raise StopIteration inside `on_train_start`, which the guard below would
-        # swallow — the probe would disable itself and log nothing, silently.
+        # `num_batches` 8. The old default of 2 was justified by "the val split is 200
+        # episodes", which was stale by two orders of magnitude: the split is ~13k episodes
+        # and `max_samples_per_batch=128`, so 2 batches sampled ~2% of it. Under the
+        # scene-level holdout that mattered more than the count suggests — the val loader
+        # read in index order, so those 2 batches came from one or two of the eight
+        # held-out scenes. The loader now shuffles (fixed seed) and this asks for 8.
+        # If a split really does run out, `on_train_start` says so rather than silently
+        # disabling the probe.
         super().__init__()
         self.every_n = int(every_n)
         self.num_batches = int(num_batches)

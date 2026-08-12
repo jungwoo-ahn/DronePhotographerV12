@@ -217,6 +217,43 @@ class _Entry:
     candidates: list[tuple[ViewRecord, np.ndarray]]   # (goal frame, goal_vec)
 
 
+def shoot_column(window: TrajectoryWindow) -> np.ndarray:
+    """The `shoot` channel for this window: (chunk_size,) float32, latched at arrival.
+
+    A LATCHED STATE, not an event spike: 0 before the goal frame, 1 from it onward. This is
+    the `DimType.GRIPPER` reading of the channel — a gripper is open or closed, it does not
+    "fire" — and it means an off-by-one step does not erase the signal the way a single-step
+    spike would.
+
+    It pairs with a property the data already has. `iter_goal_start_windows` clamps the walk
+    at the goal, so every keyframe past arrival IS the goal frame and its pose action is
+    exactly zero. So `shoot=1` and `action=0` turn on together: "you are there, stop moving,
+    take the photo." That pairing is asserted in the tests.
+
+    Why this exists at all: the policy does not recognise arrival. Measured in
+    docs/v4_session_changes.md section 11, the final chunk moves as much as the previous one
+    (0.31 vs 0.25), so no threshold on action magnitude can separate "arrived" from "still
+    travelling". Termination has to be something the policy DECLARES.
+
+    Labels are free by hindsight — the goal is the achieved profile of `goal_frame`, so
+    arrival is wherever the walk first reaches that frame. Chunks whose goal lies beyond the
+    chunk are all zeros ("not there yet"); measured on the export, ~30% contain the arrival.
+
+    Arrival is found IN `keyframes` rather than computed from frame indices. The walk is
+    `idx[k] = start + direction*k` clamped at the goal (`annotations.iter_goal_start_windows`)
+    and `direction` can be NEGATIVE — the goal is drawn with `delta = abs(g - s)`, so it may
+    sit before the start. A signed `goal_idx - start_idx` is then negative and latches the
+    whole chunk to 1: measured, that put shoot=1 on 62% of chunks against a true arrival rate
+    of 30%, every one of them with a non-zero pose action. Reading the walk cannot drift from
+    how the walk is built.
+    """
+    frames = window.keyframes if window.keyframes else [
+        window.start, *window.intermediate, window.end]
+    goal_idx = window.goal_frame.frame_idx
+    k = next((i for i, f in enumerate(frames) if f.frame_idx == goal_idx), len(frames))
+    return (np.arange(window.chunk_size) >= k).astype(np.float32)
+
+
 def _compute_action_chunk(window: TrajectoryWindow) -> np.ndarray:
     """The chunk_size actions between consecutive keyframes.
 

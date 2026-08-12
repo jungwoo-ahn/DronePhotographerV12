@@ -39,7 +39,7 @@ lr = 5.0e-05
 # cycle completes and indexes it with None, which kills the run with
 # "ListConfig indices must be integers or slices, not NoneType" -- it took out a run
 # at exactly iteration 2000 with cycle_lengths = [2000].
-cycle_lengths = [20000]
+cycle_lengths = [40000]
 warm_up_steps = [100]
 
 [trainer]
@@ -49,8 +49,8 @@ logging_iter    = 1
 
 [checkpoint]
 load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
-# Cosmos NEVER prunes checkpoints -- every save is kept. The params-only base DCP is
-# already 30 GB and a training checkpoint also carries optimizer state and EMA, so a
-# 20k-iter run at save_iter=100 would write ~200 of them. Keep this coarse and raise
-# max_iter instead; 100 only makes sense for the 100-iter smoke (one save, at the end).
+# Cosmos NEVER prunes checkpoints -- every save is kept, and a training checkpoint (model
+# + optimizer state + EMA) measures 137 GB, not the ~30 GB of the params-only base DCP.
+# CheckpointRetention(keep_last=5) is what actually caps a run, at ~685 GB. Keep this
+# coarse and raise max_iter instead; 100 only makes sense for the 100-iter smoke.
 save_iter = 1000

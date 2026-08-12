@@ -47,6 +47,8 @@ except Exception:  # noqa: BLE001
 
 from cosmos_framework.utils.callback import Callback
 
+from src.data.cosmos_camera_dataset import CAMERA_ACTION_DIM
+
 SECTORS = ("front", "front-right", "right", "back-right",
            "back", "back-left", "left", "front-left")
 
@@ -158,8 +160,19 @@ class CameraPolicyDiagnostics(Callback):
         payload: dict[str, float] = {}
         actions = self._actions(data_batch)
         if actions is not None:
-            flat = actions.reshape(-1, 9)
-            translation, rot6d = flat[:, :3], flat[:, 3:]
+            # 10 wide now (9 pose + shoot). Hardcoding 9 here silently reshaped the
+            # batch wrong the moment the shoot channel landed, folding one sample's
+            # shoot value into the next sample's translation.
+            flat = actions.reshape(-1, CAMERA_ACTION_DIM)
+            translation, rot6d = flat[:, :3], flat[:, 3:9]
+            shoot = flat[:, 9]
+
+            # The shoot channel is the whole point of the 10th dim, so it has to be
+            # visible from iteration one rather than only at eval time. These are the
+            # LABELS reaching the model; whether the policy reproduces them is measured
+            # in closed_loop_eval.
+            payload["shoot/label_positive_frac"] = float((shoot > 0.5).mean())
+            payload["shoot/label_mean"] = float(shoot.mean())
 
             # Scale balance — the reason the action is fed raw at all.
             t_std, r_std = float(translation.std()), float(rot6d[:, [1, 2, 3, 5]].std())

@@ -40,10 +40,18 @@ import numpy as np
 
 from src.common.action_repr import ACTION_DIM
 from src.common.facing import sector8
+
 from src.common.goal_space import RENDER_HEIGHT, RENDER_WIDTH
 from src.goal_authoring import vocab
 from src.goal_authoring.vocab import _classify
 from src.common.goal_space import DEFAULT_GOAL_KEYS, SUBJECT_BEARING_KEY
+
+# What gets WRITTEN: the 9 pose dims plus the shoot channel. `ACTION_DIM` stays 9 because it
+# describes `encode_action_9d`'s output, which is still pose-only — widening it there would
+# silently change every caller of the pose encoder. Written width is a property of the
+# dataset, so it is named here. Matches NVIDIA's own reference layout for this framework
+# (docs/action_policy_libero_posttrain.md: "10D = pos 3 + rot6d 6 + gripper 1").
+WRITTEN_ACTION_DIM = ACTION_DIM + 1
 
 VIDEO_KEY = "observation.images.image"
 DEFAULT_FPS = 30
@@ -167,6 +175,17 @@ class EpisodeSpec:
     frame_paths: list[Path]          # chunk_size + 1 images
     actions: np.ndarray              # (chunk_size, 9) float32
     prompt: str
+    # Where this sample came from, "<scene>__<object>". Carried so the split can be defined
+    # on it: without provenance in the written dataset the only thing a loader can slice on
+    # is episode_index, and a contiguous slice of that is placement-disjoint but
+    # scene-complete on both sides — it was measured at 88/88 scene overlap. The value is
+    # already in `frame_paths`; it was simply being thrown away here.
+    placement: str = ""
+
+    @property
+    def scene(self) -> str:
+        """Scene half of the placement name. `_split_key(level="scene")` uses the same rule."""
+        return self.placement.split("__")[0]
 
 
 def _ffmpeg_exe() -> str:
@@ -265,7 +284,7 @@ def write_lerobot_dataset(
         start_index = global_index
         for f in range(chunk + 1):
             action = (ep.actions[f] if f < chunk
-                      else np.zeros(ACTION_DIM, dtype=np.float32))   # pad the last frame
+                      else np.zeros(WRITTEN_ACTION_DIM, dtype=np.float32))  # pad the last frame
             rows.append({
                 "index": global_index,
                 "episode_index": ep_idx,
@@ -279,6 +298,12 @@ def write_lerobot_dataset(
             "episode_index": ep_idx,
             "tasks": [ep.prompt],
             "length": chunk + 1,
+            # Provenance. LeRobot ignores unknown columns and the framework loader keeps
+            # whole rows (`{int(row["episode_index"]): row}` in base_dataset.py), so these
+            # ride along with no loader change — and give the dataset something to split on
+            # that is not episode order.
+            "placement": ep.placement,
+            "scene": ep.scene,
             "data/chunk_index": 0,
             "data/file_index": 0,
             "dataset_from_index": start_index,
@@ -317,8 +342,9 @@ def write_lerobot_dataset(
         "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
         "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
         "features": {
-            "action": {"dtype": "float32", "shape": [ACTION_DIM],
-                       "names": ["dx", "dy", "dz", "r0", "r1", "r2", "r3", "r4", "r5"]},
+            "action": {"dtype": "float32", "shape": [WRITTEN_ACTION_DIM],
+                       "names": ["dx", "dy", "dz", "r0", "r1", "r2",
+                                 "r3", "r4", "r5", "shoot"]},
             VIDEO_KEY: {"dtype": "video", "shape": [None, None, 3]},
             "timestamp": {"dtype": "float32", "shape": [1]},
             "frame_index": {"dtype": "int64", "shape": [1]},

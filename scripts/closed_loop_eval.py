@@ -93,6 +93,16 @@ ap.add_argument("--out", default=f"{V12}/runs/closed_loop/eval.json")
 ap.add_argument("--resume", type=int, default=1,
                 help="continue from <out>.partial.json instead of redoing "
                      "episodes a preempted run already finished")
+ap.add_argument("--val-scenes", default="configs/val_scenes.json",
+                help="scene manifest defining the holdout, matching the training split. "
+                     "Pass '' to fall back to replaying the export enumeration, which is "
+                     "how every pre-v5 number defined held-out (never-sampled placements, "
+                     "whose SCENES the model had still trained on).")
+ap.add_argument("--stop-on-shoot", type=int, default=1,
+                help="end the rollout at the first chunk whose predicted shoot channel "
+                     "crosses --shoot-threshold. 0 keeps the fixed n_chunks length, which "
+                     "is what every pre-v5 number was measured with.")
+ap.add_argument("--shoot-threshold", type=float, default=0.5)
 ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--no-ema", action="store_true", help="load raw weights instead of EMA")
 args = ap.parse_args()
@@ -124,6 +134,7 @@ from src.common.goal_space import (  # noqa: E402
 )
 from src.common.reward import CameraIntrinsics, pose_to_geometry, _geometry_distance  # noqa: E402
 from src.common.run_info import write_run_info as _write_run_info  # noqa: E402
+from src.data.cosmos_camera_dataset import CAMERA_ACTION_DIM  # noqa: E402
 from src.data.lerobot_export import goal_prompt  # noqa: E402
 
 SECTOR_ORDER = ("front", "front-right", "right", "back-right",
@@ -194,7 +205,7 @@ def predict_chunk(model, frame_uint8: np.ndarray, prompt: str, seed: int) -> np.
     batch = build_action_batch(
         video=video,
         action=torch.zeros(args.chunk_size, 64, dtype=torch.float32),
-        raw_action_dim=9,
+        raw_action_dim=CAMERA_ACTION_DIM,
         prompt=prompt,
         view_point="ego_view",
         domain_name="camera_pose",
@@ -320,10 +331,23 @@ def pick_episodes() -> list:
     dirs = sorted(d for d in os.listdir(args.root) if os.path.isdir(os.path.join(args.root, d)))
     trained: set[str] = set()
     if args.held_out_only:
-        trained = trained_placements()
-        dirs = [d for d in dirs if d not in trained]
-        print(f"[eval] held-out pool: {len(dirs)} placements "
-              f"({len(trained)} excluded as trained-on)", flush=True)
+        if args.val_scenes:
+            # A placement is held out iff its SCENE is in the val manifest -- the same
+            # definition the training split uses, so "held-out" means one thing in this
+            # repo instead of two. Exact and instant; the replay below is a ~35 min scan
+            # that could only ever say "this placement was not sampled", which is weaker
+            # (its scene, and so its whole visual environment, was still trained on).
+            val_scenes = frozenset(json.loads(Path(args.val_scenes).read_text())["scenes"])
+            keep = [d for d in dirs if d.split("__")[0] in val_scenes]
+            trained = set(dirs) - set(keep)
+            dirs = keep
+            print(f"[eval] held-out pool: {len(dirs)} placements from "
+                  f"{len(val_scenes)} val scenes ({args.val_scenes})", flush=True)
+        else:
+            trained = trained_placements()
+            dirs = [d for d in dirs if d not in trained]
+            print(f"[eval] held-out pool: {len(dirs)} placements "
+                  f"({len(trained)} excluded as trained-on) [export-replay mode]", flush=True)
     # Own generator, seeded separately from the export replay above, which consumed
     # the global one.
     rng = random.Random(args.seed)
@@ -449,13 +473,27 @@ def main() -> int:
             shots.append({"tag": "start", "path": save("start", obs["image"]), "d": d0})
 
             prompt = make_prompt(goal_vec, crop=window.goal_frame.raw)
+            declared_stop = None            # chunk index where the policy said "shoot"
             for c in range(n_chunks):
                 frame = np.asarray(obs["image"])
                 chunk = predict_chunk(model, frame, prompt, seed=args.seed + i * 100 + c)
+                # dim 9 is the shoot channel: a latched [0,1] state, thresholded the way
+                # NVIDIA's own reference client thresholds the gripper
+                # (docs/action_policy_libero_posttrain.md: "model emits [0,1]"). This is
+                # the point of the 10th dim — the policy DECLARES arrival, because action
+                # magnitude cannot be thresholded for it: the final chunk moves as much as
+                # the previous one (0.31 vs 0.25, docs/v4_session_changes.md section 11).
+                shoot = float(np.max(chunk[:, 9])) if chunk.shape[1] > 9 else 0.0
+                if declared_stop is None and shoot > args.shoot_threshold:
+                    declared_stop = c
+                    if args.stop_on_shoot:
+                        # Stop BEFORE executing: the shoot state means "you are already
+                        # there". Its own pose action is zero in training anyway.
+                        break
                 # BlenderRolloutEnv.step applies the 9D action via apply_action_9d, which
                 # decodes rot6d and re-projects upright — the same decode the training
                 # data was encoded with.
-                for step in chunk:
+                for step in chunk[:, :9]:
                     obs, _ = env.step(step, render=False)
                 obs = env.reset(env.position, env.forward, env.up)   # render the new view
                 d = geometry_distance(env.position, env.forward, env.up, window.goal_frame, intr)
@@ -467,6 +505,9 @@ def main() -> int:
             results.append({
                 "placement": name, "object": _window_object(window),
                 "sector": sec, "bearing": bearing, "delta": delta, "chunks": n_chunks,
+                # Logged even when --stop-on-shoot is off, so a fixed-length rollout still
+                # answers "where WOULD it have stopped" against the same trace.
+                "declared_stop": declared_stop, "executed_chunks": len(trace) - 1,
                 "d_start": d0, "d_end": d1, "d_best": d_best,
                 "improvement": d0 - d1, "best_improvement": d0 - d_best,
                 "trace": trace, "shots": shots,

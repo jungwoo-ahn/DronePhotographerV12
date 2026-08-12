@@ -6,14 +6,30 @@ Lives here rather than inside `repos/cosmos-framework` so it stays version-contr
 
 Shape of one sample (built by `ActionBaseDataset._build_result`):
     video   uint8 [C, chunk_length+1, H, W]
-    action  float32 [chunk_length, 9]      raw (see `action_normalization` below)
+    action  float32 [chunk_length, 10]     raw; dims 0-8 pose, dim 9 shoot
     ai_caption str                         our goal prompt
     plus mode / domain_id / conditioning_fps / viewpoint / idle_frames
 
-`camera_pose` is a registered embodiment (domain_id 2, raw action dim 9), and 9D =
-`build_action_spec(Pos(), Rot("rot6d"))` — position + 6D rotation, NO gripper. Do not pad a
-dummy gripper channel: it would send `compute_idle_frames` down the gripper branch and break
-the raw_action_dim=9 contract the inference server assumes.
+Actions are 10D = `build_action_spec(Pos(), Rot("rot6d"), Gripper())` — position, 6D
+rotation, and the SHOOT channel on dim 9. The gripper slot is not a dummy pad: it carries a
+latched 0/1 "I have arrived, take the photo" state (see `dataset_base.shoot_column`), because
+the policy cannot otherwise signal termination — measured in docs/v4_session_changes.md
+section 11, its final chunk moves as much as the previous one, so no threshold on action
+magnitude separates "arrived" from "still travelling".
+
+The two things an earlier version of this note warned about are now handled deliberately
+rather than avoided:
+  * `compute_idle_frames` gains a GRIPPER branch (`max |dgripper| < eps_g`). Idle is an AND
+    across dim types, so this can only make it STRICTER. It matters because idle_frames
+    reaches the model through the prompt in policy mode (json_formatter.py
+    `_should_append_idle_frame_info`), so it was measured rather than assumed — over 800
+    exported episodes: unchanged 80.4%, -1 frame 16.5%, **-3 frames 3.1%**. The -3 is not a
+    bug and not the "at most one frame" this note first claimed: `min_streak=3` means the
+    shoot transition landing inside an idle run of exactly 3 deletes the whole run. The
+    stricter number is also the more correct one — the frame where the shoot state changes
+    is genuinely not idle.
+  * the raw-dim contract is satisfied by registering `camera_pose_shoot` below, instead of
+    silently emitting 10 where the registry says 9.
 
 `action_normalization=None` (raw) is deliberate, and matches Cosmos's own camera_pose usage
 (translation_scale 1.0, rotation dims skipped). Measured on our data: rot6d sits at the
@@ -25,6 +41,7 @@ and rotation (std ~0.04) sit within ~3.4x.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -38,6 +55,7 @@ if _CF.exists() and str(_CF) not in sys.path:
 
 from cosmos_framework.data.generator.action.action_spec import (  # noqa: E402
     ActionSpec,
+    Gripper,
     Pos,
     Rot,
     build_action_spec,
@@ -45,10 +63,31 @@ from cosmos_framework.data.generator.action.action_spec import (  # noqa: E402
 from cosmos_framework.data.generator.action.datasets.base_dataset import (  # noqa: E402
     ActionBaseDataset,
 )
+from cosmos_framework.data.generator.action.domain_utils import (  # noqa: E402
+    EMBODIMENT_TO_DOMAIN_ID,
+    EMBODIMENT_TO_RAW_ACTION_DIM,
+)
 
-CAMERA_ACTION_DIM = 9
+CAMERA_ACTION_DIM = 10                 # 3 pos + 6 rot6d + 1 shoot
 VIDEO_KEY = "observation.images.image"
-DOMAIN_NAME = "camera_pose"
+DOMAIN_NAME = "camera_pose_shoot"
+
+# Registered from HERE rather than by editing the vendored registry. Adding a key leaves the
+# stock `camera_pose` (9D) untouched and survives a framework update, where patching
+# `EMBODIMENT_TO_RAW_ACTION_DIM["camera_pose"] = 10` would be reverted by the next sync and
+# would also lie to anything else reading that table.
+#
+# The DOMAIN ID stays 2 — the same row `camera_pose` uses. That matters: `DomainAwareLinear`
+# (mot/domain_aware_linear.py) stores per-domain weights as `nn.Embedding(num_domains,
+# out*in)`, so `action2llm`/`llm2action` are a SEPARATE matrix per domain. Keeping id 2 means
+# we keep fine-tuning the pretrained camera_pose row instead of starting a fresh one.
+#
+# The same fact is why the shoot channel inherits nothing from the gripper embodiments:
+# whatever `droid_lerobot` (8) or `fractal` (20) learned at index 9 lives in THEIR rows. The
+# 10D layout is NVIDIA's own (docs/action_policy_libero_posttrain.md: "10D = pos 3 + rot6d 6
+# + gripper 1", "model emits [0,1]"), so we get the plumbing — not the weights.
+EMBODIMENT_TO_DOMAIN_ID.setdefault(DOMAIN_NAME, EMBODIMENT_TO_DOMAIN_ID["camera_pose"])
+EMBODIMENT_TO_RAW_ACTION_DIM.setdefault(DOMAIN_NAME, CAMERA_ACTION_DIM)
 
 
 class CameraPoseLeRobotDataset(ActionBaseDataset):
@@ -69,7 +108,8 @@ class CameraPoseLeRobotDataset(ActionBaseDataset):
         video_key: str = VIDEO_KEY,
         video_backend: str | None = "pyav",
         split: str = "train",
-        val_ratio: float = 0.05,
+        val_scenes: str | None = "configs/val_scenes.json",
+        val_ratio: float | None = None,
     ) -> None:
         super().__init__(
             root=root,
@@ -90,21 +130,38 @@ class CameraPoseLeRobotDataset(ActionBaseDataset):
         self._video_backend = video_backend
         # Every episode is exactly chunk_length+1 frames, so episode index == sample index.
         all_episodes = sorted(self._episodes)
-        # Held-out split. The export writes episodes grouped by placement, so a
-        # contiguous tail is a scene-level holdout rather than a reshuffle of the same
-        # scenes — without it a val loss would mostly measure memorisation of scenes
-        # the model already trains on.
         if split not in ("train", "val"):
             raise ValueError(f"split must be 'train' or 'val', got {split!r}")
-        n_val = max(1, int(len(all_episodes) * float(val_ratio))) if val_ratio > 0 else 0
-        self._episode_indices = (
-            all_episodes[: len(all_episodes) - n_val] if split == "train"
-            else all_episodes[len(all_episodes) - n_val:]
-        )
+        if val_ratio is not None:
+            raise ValueError(
+                "val_ratio is gone. It took the last 5% of episode_index, which is "
+                "placement-disjoint but scene-COMPLETE on both sides — measured at 88/88 "
+                "scene overlap and 99/99 object overlap, so the val loss it produced was "
+                "'a new camera path in a room the model already knows'. Use val_scenes."
+            )
+
+        # Scene-level holdout, read from the export's own provenance column.
+        val_set = frozenset(json.loads(Path(val_scenes).read_text())["scenes"])
+        missing = [i for i in all_episodes if "scene" not in self._episodes[i]]
+        if missing:
+            # Deliberately fatal. The tempting fallback — "no scene column, use the tail" —
+            # is exactly the shape of bug that let two plan_rerender_yaw scripts evaluate a
+            # retired gate for weeks: the run works, the number means something else.
+            raise ValueError(
+                f"{len(missing)} episodes in {root} have no 'scene' column, so a scene-level "
+                "split cannot be built. This dataset predates provenance; re-export with "
+                "scripts/export_lerobot.py (it writes 'scene' and 'placement')."
+            )
+        want_val = split == "val"
+        self._episode_indices = [
+            i for i in all_episodes
+            if (self._episodes[i]["scene"] in val_set) == want_val
+        ]
         if not self._episode_indices:
             raise ValueError(f"{split} split is empty (episodes={len(all_episodes)}, "
-                             f"val_ratio={val_ratio})")
+                             f"val_scenes={val_scenes})")
         self.split = split
+        self.val_scenes = val_set
 
     # ---- ActionBaseDataset contract -------------------------------------------------
     @property
@@ -112,7 +169,7 @@ class CameraPoseLeRobotDataset(ActionBaseDataset):
         return CAMERA_ACTION_DIM
 
     def _action_spec(self) -> ActionSpec:
-        return build_action_spec(Pos(), Rot("rot6d"))      # 9D, no gripper
+        return build_action_spec(Pos(), Rot("rot6d"), Gripper())   # 10D, shoot on dim 9
 
     @classmethod
     def _stats_path(cls) -> Path:
@@ -197,7 +254,7 @@ def get_camera_pose_sft_dataset(
     append_resolution_info: bool = True,
     append_idle_frames: bool = False,
     split: str = "train",
-    val_ratio: float = 0.05,
+    val_scenes: str | None = "configs/val_scenes.json",
 ):
     """Factory the training config points at (mirrors `get_action_libero_sft_dataset`).
 
@@ -215,7 +272,7 @@ def get_camera_pose_sft_dataset(
     base = CameraPoseLeRobotDataset(
         root=root, fps=fps, chunk_length=chunk_length, image_size=image_size,
         mode=mode, action_normalization=action_normalization,
-        split=split, val_ratio=val_ratio,
+        split=split, val_scenes=val_scenes,
     )
     transform = ActionTransformPipeline(
         tokenizer_config=tokenizer_config,

@@ -170,7 +170,7 @@ action_policy_camera_nano = LazyDict(
                 # This calls training_step under no_grad on fixed held-out batches at
                 # fixed noise, plus the same on cached train batches so the gap is a
                 # difference of comparable estimators.
-                heldout_loss=L(HeldOutLossProbe)(every_n=500, num_batches=2),
+                heldout_loss=L(HeldOutLossProbe)(every_n=500, num_batches=8),
                 # Cosmos never deletes a checkpoint and these are >30 GB each.
                 checkpoint_retention=L(CheckpointRetention)(
                     keep_last=5, keep_best=3, metric_key=None, min_age_s=900.0,
@@ -305,7 +305,12 @@ action_policy_camera_nano = LazyDict(
                             # camera_pose usage is raw too (translation_scale 1.0).
                             action_normalization=None,
                             split="val",
-                            iterable_shuffle=False,
+                            # True, with the SAME fixed seed: the probe caches its batches
+                            # once at on_train_start and reuses them forever, so this stays
+                            # deterministic — it just draws them from across the whole
+                            # holdout instead of the first index block, which under a
+                            # scene-level split is one or two scenes out of eight.
+                            iterable_shuffle=True,
                             episode_shuffle_seed=42,
                             resolution=None,
                             max_action_dim="${model.config.max_action_dim}",

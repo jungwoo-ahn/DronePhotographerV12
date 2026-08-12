@@ -27,6 +27,7 @@ from src.common.dataset_base import (
     DEFAULT_EXCLUDE_OBJECTS,
     _compute_action_chunk,
     _window_object,
+    shoot_column,
 )
 from src.common.facing import sector8
 
@@ -55,6 +56,13 @@ ap.add_argument("--episodes-per-video", type=int, default=20000,
                 help="episodes per mp4. One file for everything makes each episode's "
                      "from_timestamp seek scale with total size — a 150k single-file "
                      "export halved training throughput.")
+ap.add_argument("--val-scenes", default="configs/val_scenes.json",
+                help="manifest of scenes held out as val. Placements are partitioned by scene "
+                     "BEFORE the fill and each side is balanced separately — filtering a "
+                     "globally-balanced draw afterwards would re-skew both sides by whatever "
+                     "those scenes happened to contain. Pass '' to export one undivided set.")
+ap.add_argument("--val-fraction", type=float, default=0.10,
+                help="share of --max-episodes spent on the val scenes")
 ap.add_argument("--seed", type=int, default=0)
 args = ap.parse_args()
 
@@ -72,81 +80,122 @@ random.seed(args.seed)
 random.shuffle(placements)
 print(f"placements: {len(placements)} across {len(args.roots)} root(s)", flush=True)
 
-episodes: list[EpisodeSpec] = []
-sectors: Counter = Counter()
-objects: Counter = Counter()
-t0 = time.time()
-# Sector-balanced fill. The pool is ~36% back and ~4% left, so taking episodes in
-# placement order reproduces that skew no matter how many are taken. Every sector has
-# far more than max_episodes/8 goals available (checked: the scarcest, `left`, has
-# ~3100 goals across ~470 placements), so an even draw is feasible without inventing
-# data — it just needs scanning to continue past the point where `back` is already full.
-per_sector_cap = (args.max_episodes // 8) if args.balance_sectors else args.max_episodes
-sector_counts: Counter = Counter()
+# --- split the PLACEMENTS by scene before drawing anything ------------------------
+# The alternative (draw globally, filter afterwards) cannot work: the draw is
+# sector-balanced, and removing whichever scenes are val re-skews both sides by whatever
+# those scenes happened to contain. Partition first, balance each side on its own.
+val_scenes: frozenset[str] = frozenset()
+if args.val_scenes:
+    _m = json.loads(Path(args.val_scenes).read_text())
+    val_scenes = frozenset(_m["scenes"])
+    print(f"val scenes: {len(val_scenes)} held out whole (from {args.val_scenes})")
+
+split_of = {name: ("val" if name.split("__")[0] in val_scenes else "train")
+            for name, _ in placements}
+n_val_pl = sum(1 for v in split_of.values() if v == "val")
+print(f"  train placements {len(placements)-n_val_pl}  |  val placements {n_val_pl}")
+
 near_count = 0
 crop_counts: Counter = Counter()
+t0 = time.time()
 
 
-def _full() -> bool:
-    if not args.balance_sectors:
-        return len(episodes) >= args.max_episodes
-    return all(sector_counts[s] >= per_sector_cap for s in SECTOR_ORDER)
+def fill(split: str, budget: int) -> tuple[list[EpisodeSpec], Counter, Counter]:
+    """Draw up to `budget` sector-balanced episodes from this split's placements.
 
+    Sector-balanced fill. The pool is ~36% back and ~4% left, so taking episodes in
+    placement order reproduces that skew no matter how many are taken. Every sector has
+    far more than budget/8 goals available (checked: the scarcest, `left`, has ~3100 goals
+    across ~470 placements), so an even draw is feasible without inventing data — it just
+    needs scanning to continue past the point where `back` is already full.
+    """
+    global near_count
+    out: list[EpisodeSpec] = []
+    sectors: Counter = Counter()
+    objects: Counter = Counter()
+    cap = (budget // 8) if args.balance_sectors else budget
+    mine = [(n, p) for n, p in placements if split_of[n] == split]
 
-for i, (name, path) in enumerate(placements):
-    if _full() or len(episodes) >= args.max_episodes:
-        break
-    obj = name.split("__", 1)[1] if "__" in name else name
-    if obj in DEFAULT_EXCLUDE_OBJECTS:
-        continue
-    try:
-        windows = list(iter_goal_start_windows(
-            path, chunk_size=args.chunk_size, max_per_pair=args.per_placement,
-        ))
-    except Exception as exc:  # noqa: BLE001
-        print(f"  skip {name[:40]}: {exc}")
-        continue
-    random.shuffle(windows)
-    taken = 0
-    for w in windows:
-        if taken >= args.per_placement or len(episodes) >= args.max_episodes:
+    def _full() -> bool:
+        if not args.balance_sectors:
+            return len(out) >= budget
+        return all(sectors[s] >= cap for s in SECTOR_ORDER)
+
+    for i, (name, path) in enumerate(mine):
+        if _full() or len(out) >= budget:
             break
-        g = goal_vector(w.goal_frame.raw, DEFAULT_GOAL_KEYS, object_key=_window_object(w))
-        if not np.isfinite(g).all():
+        obj = name.split("__", 1)[1] if "__" in name else name
+        if obj in DEFAULT_EXCLUDE_OBJECTS:
             continue
-        sec = sector8(float(g[DEFAULT_GOAL_KEYS.index(SUBJECT_BEARING_KEY)]))
-        if args.balance_sectors and sector_counts[sec] >= per_sector_cap:
-            continue                    # this sector is full; keep the window for nobody
-        frames = [Path(k.image) for k in w.keyframes]
-        if not all(f.exists() for f in frames):
+        try:
+            windows = list(iter_goal_start_windows(
+                path, chunk_size=args.chunk_size, max_per_pair=args.per_placement,
+            ))
+        except Exception as exc:  # noqa: BLE001
+            print(f"  skip {name[:40]}: {exc}")
             continue
-        episodes.append(EpisodeSpec(
-            frame_paths=frames, actions=_compute_action_chunk(w),
-            # crop comes from the goal frame's signed bbox, not the goal vector
-            prompt=goal_prompt(g, crop=w.goal_frame.raw),
-        ))
-        sectors[sec] += 1
-        sector_counts[sec] += 1
-        if abs(w.goal_frame.frame_idx - w.start_frame_idx) < args.chunk_size:
-            near_count += 1
-        _r = w.goal_frame.raw
-        _t, _b = _r.get('top_cut_frac', 0.0) > 0.02, _r.get('bot_cut_frac', 0.0) > 0.02
-        crop_counts['both' if (_t and _b) else 'top' if _t else 'bottom' if _b else 'none'] += 1
-        objects[obj] += 1
-        taken += 1
-    if (i + 1) % 200 == 0:
-        print(f"  ...{i+1} placements scanned, {len(episodes)} episodes, "
-              f"{time.time()-t0:.0f}s", flush=True)
+        random.shuffle(windows)
+        taken = 0
+        for w in windows:
+            if taken >= args.per_placement or len(out) >= budget:
+                break
+            g = goal_vector(w.goal_frame.raw, DEFAULT_GOAL_KEYS, object_key=_window_object(w))
+            if not np.isfinite(g).all():
+                continue
+            sec = sector8(float(g[DEFAULT_GOAL_KEYS.index(SUBJECT_BEARING_KEY)]))
+            if args.balance_sectors and sectors[sec] >= cap:
+                continue                # this sector is full; keep the window for nobody
+            frames = [Path(k.image) for k in w.keyframes]
+            if not all(f.exists() for f in frames):
+                continue
+            # 9 pose dims + the shoot channel. Concatenated HERE rather than inside
+            # `_compute_action_chunk`, so that function stays pose-only for its other
+            # callers (fit_action_stats, the v11 path) and `encode_action_9d` keeps its
+            # meaning — pose dims 0-8 remain comparable with the v4 run.
+            pose = _compute_action_chunk(w)
+            act = np.concatenate([pose, shoot_column(w)[:, None]], axis=1)
+            out.append(EpisodeSpec(
+                frame_paths=frames, actions=act,
+                # crop comes from the goal frame's signed bbox, not the goal vector
+                prompt=goal_prompt(g, crop=w.goal_frame.raw),
+                placement=name,
+            ))
+            sectors[sec] += 1
+            if abs(w.goal_frame.frame_idx - w.start_frame_idx) < args.chunk_size:
+                near_count += 1
+            _r = w.goal_frame.raw
+            _t, _b = _r.get('top_cut_frac', 0.0) > 0.02, _r.get('bot_cut_frac', 0.0) > 0.02
+            crop_counts['both' if (_t and _b) else 'top' if _t else 'bottom' if _b else 'none'] += 1
+            objects[obj] += 1
+            taken += 1
+        if (i + 1) % 200 == 0:
+            print(f"  [{split}] ...{i+1}/{len(mine)} placements scanned, {len(out)} episodes, "
+                  f"{time.time()-t0:.0f}s", flush=True)
 
-print(f"\nepisodes: {len(episodes)}  objects: {len(objects)}  ({time.time()-t0:.0f}s)")
-tot = sum(sectors.values()) or 1
-print("sector mix:", {s_: f"{100*sectors[s_]/tot:.1f}%" for s_ in SECTOR_ORDER})
-if args.balance_sectors:
-    short = {s_: sectors[s_] for s_ in SECTOR_ORDER if sectors[s_] < per_sector_cap}
-    print(f"per-sector target {per_sector_cap}: "
-          + ("all sectors filled" if not short else f"UNDER TARGET {short}"))
-    # Said out loud on purpose: a sector that could not fill is a real limit of the
-    # data, and a silent shortfall would read as balance that was never achieved.
+    t = sum(sectors.values()) or 1
+    print(f"\n[{split}] episodes {len(out)}  objects {len(objects)}  ({time.time()-t0:.0f}s)")
+    print(f"[{split}] sector mix:", {s_: f"{100*sectors[s_]/t:.1f}%" for s_ in SECTOR_ORDER})
+    if args.balance_sectors:
+        short = {s_: sectors[s_] for s_ in SECTOR_ORDER if sectors[s_] < cap}
+        print(f"[{split}] per-sector target {cap}: "
+              + ("all sectors filled" if not short else f"UNDER TARGET {short}"))
+        # Said out loud on purpose: a sector that could not fill is a real limit of the
+        # data, and a silent shortfall would read as balance that was never achieved.
+    return out, sectors, objects
+
+
+n_val_ep = int(args.max_episodes * args.val_fraction) if val_scenes else 0
+val_eps, _, _ = fill("val", n_val_ep) if n_val_ep else ([], Counter(), Counter())
+train_eps, sectors, objects = fill("train", args.max_episodes - len(val_eps))
+
+# Train first, then val. Order no longer defines the split — `scene` does — but keeping
+# each split contiguous keeps the mp4 shards from interleaving the two.
+episodes: list[EpisodeSpec] = train_eps + val_eps
+print(f"\ntotal episodes: {len(episodes)}  (train {len(train_eps)}, val {len(val_eps)})")
+_tr_sc = {e.scene for e in train_eps}
+_va_sc = {e.scene for e in val_eps}
+assert not (_tr_sc & _va_sc), f"scene leaked across the split: {sorted(_tr_sc & _va_sc)[:5]}"
+print(f"scene disjoint: train {len(_tr_sc)} scenes, val {len(_va_sc)} scenes, overlap 0")
 print(f"near-goal episodes (delta < {args.chunk_size}): "
       f"{near_count}/{len(episodes)} = {100*near_count/max(1,len(episodes)):.0f}%")
 # Crop mix, so a gate regression is visible HERE rather than after training: the
