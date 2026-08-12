@@ -125,3 +125,21 @@ def test_missing_scene_column_is_fatal():
     from src.data.cosmos_camera_dataset import CameraPoseLeRobotDataset
     with pytest.raises(ValueError, match="scene"):
         CameraPoseLeRobotDataset(root=str(LEGACY_ROOT))
+
+
+def test_manifest_default_is_absolute():
+    """The training launcher `cd`s into the cosmos-framework root before importing this,
+    so a relative default resolves inside the vendored checkout and dies. The 100-iter
+    smoke caught exactly that: FileNotFoundError 'configs/val_scenes.json'."""
+    from src.data.cosmos_camera_dataset import DEFAULT_VAL_SCENES
+    p = Path(DEFAULT_VAL_SCENES)
+    assert p.is_absolute(), DEFAULT_VAL_SCENES
+    assert p.exists(), DEFAULT_VAL_SCENES
+
+
+def test_relative_manifest_resolves_against_the_repo_not_the_cwd(tmp_path, monkeypatch):
+    from src.data import cosmos_camera_dataset as m
+    monkeypatch.chdir(tmp_path)                      # anywhere but the repo
+    rel = Path("configs/val_scenes.json")
+    resolved = rel if rel.is_absolute() else m.V12_ROOT / rel
+    assert resolved.exists(), resolved

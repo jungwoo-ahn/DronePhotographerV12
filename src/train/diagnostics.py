@@ -70,7 +70,11 @@ def _geodesic_deg(rot6d: np.ndarray) -> float:
 
 
 def _collect_action_rows(value: Any, _depth: int = 0) -> np.ndarray | None:
-    """Every (…, >=9) tensor/array reachable from `value`, flattened to [-1, 9].
+    """Every (…, >=CAMERA_ACTION_DIM) tensor/array reachable from `value`, flattened to rows.
+
+    The width is CAMERA_ACTION_DIM, not a literal. It was `9` here while the consumer had
+    already moved to 10, so this silently sliced off the shoot channel and the caller died
+    on `cannot reshape array of size 9216 into shape (10)` — nine minutes into a run.
 
     The packed batch nests differently depending on how the packer groups samples —
     `action_raw` has been seen as a plain tensor and as a list — and two earlier
@@ -82,13 +86,13 @@ def _collect_action_rows(value: Any, _depth: int = 0) -> np.ndarray | None:
     if _depth > 3 or value is None:
         return None
     if torch.is_tensor(value):
-        if value.ndim >= 2 and value.shape[-1] >= 9:
+        if value.ndim >= 2 and value.shape[-1] >= CAMERA_ACTION_DIM:
             flat = value.detach().float().cpu().reshape(-1, value.shape[-1])
-            return flat[:, :9].numpy()
+            return flat[:, :CAMERA_ACTION_DIM].numpy()
         return None
     if isinstance(value, np.ndarray):
-        if value.ndim >= 2 and value.shape[-1] >= 9:
-            return value.reshape(-1, value.shape[-1])[:, :9].astype(np.float32)
+        if value.ndim >= 2 and value.shape[-1] >= CAMERA_ACTION_DIM:
+            return value.reshape(-1, value.shape[-1])[:, :CAMERA_ACTION_DIM].astype(np.float32)
         return None
     if isinstance(value, dict):
         value = list(value.values())
@@ -112,16 +116,16 @@ class CameraPolicyDiagnostics(Callback):
     # ---- helpers ----------------------------------------------------------
     @staticmethod
     def _actions(data_batch: dict[str, Any]) -> np.ndarray | None:
-        """The RAW action target as [-1, 9].
+        """The RAW action target as [-1, CAMERA_ACTION_DIM].
 
         Prefer `action_raw` over `action`: the transform pipeline zero-pads the
-        latter out to `max_action_dim` (9 -> 64), so its statistics would be
+        latter out to `max_action_dim` (10 -> 64), so its statistics would be
         dominated by padding.
 
-        Shape-agnostic on purpose. `action_raw` is (chunk, 9) on a single sample
-        and the packer may hand over (B, chunk, 9) or a flat (total, 9) — an
+        Shape-agnostic on purpose. `action_raw` is (chunk, 10) on a single sample
+        and the packer may hand over (B, chunk, 10) or a flat (total, 10) — an
         earlier version required ndim == 3 and silently logged nothing at all.
-        Anything whose last axis is at least 9 is flattened to rows.
+        Anything whose last axis is at least CAMERA_ACTION_DIM is flattened to rows.
         """
         for key in ("action_raw", "action", "actions", "action_target"):
             rows = _collect_action_rows(data_batch.get(key))

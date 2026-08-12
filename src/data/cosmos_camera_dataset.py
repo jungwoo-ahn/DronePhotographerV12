@@ -68,6 +68,13 @@ from cosmos_framework.data.generator.action.domain_utils import (  # noqa: E402
     EMBODIMENT_TO_RAW_ACTION_DIM,
 )
 
+V12_ROOT = Path(__file__).resolve().parents[2]
+# Anchored to the REPO, not the cwd. `scripts/train_camera_policy.sh` does `cd $CF`
+# (the cosmos-framework root) because Cosmos resolves several model configs by relative
+# path, so a relative "configs/val_scenes.json" looks for it inside the framework
+# checkout and dies. Caught by the 100-iter smoke, which is what that smoke is for.
+DEFAULT_VAL_SCENES = str(V12_ROOT / "configs" / "val_scenes.json")
+
 CAMERA_ACTION_DIM = 10                 # 3 pos + 6 rot6d + 1 shoot
 VIDEO_KEY = "observation.images.image"
 DOMAIN_NAME = "camera_pose_shoot"
@@ -108,7 +115,7 @@ class CameraPoseLeRobotDataset(ActionBaseDataset):
         video_key: str = VIDEO_KEY,
         video_backend: str | None = "pyav",
         split: str = "train",
-        val_scenes: str | None = "configs/val_scenes.json",
+        val_scenes: str | None = None,
         val_ratio: float | None = None,
     ) -> None:
         super().__init__(
@@ -141,7 +148,10 @@ class CameraPoseLeRobotDataset(ActionBaseDataset):
             )
 
         # Scene-level holdout, read from the export's own provenance column.
-        val_set = frozenset(json.loads(Path(val_scenes).read_text())["scenes"])
+        manifest = Path(val_scenes) if val_scenes else Path(DEFAULT_VAL_SCENES)
+        if not manifest.is_absolute():
+            manifest = V12_ROOT / manifest       # never relative to whatever cwd we are in
+        val_set = frozenset(json.loads(manifest.read_text())["scenes"])
         missing = [i for i in all_episodes if "scene" not in self._episodes[i]]
         if missing:
             # Deliberately fatal. The tempting fallback — "no scene column, use the tail" —
@@ -159,7 +169,7 @@ class CameraPoseLeRobotDataset(ActionBaseDataset):
         ]
         if not self._episode_indices:
             raise ValueError(f"{split} split is empty (episodes={len(all_episodes)}, "
-                             f"val_scenes={val_scenes})")
+                             f"val_scenes={manifest})")
         self.split = split
         self.val_scenes = val_set
 
@@ -254,7 +264,7 @@ def get_camera_pose_sft_dataset(
     append_resolution_info: bool = True,
     append_idle_frames: bool = False,
     split: str = "train",
-    val_scenes: str | None = "configs/val_scenes.json",
+    val_scenes: str | None = None,
 ):
     """Factory the training config points at (mirrors `get_action_libero_sft_dataset`).
 

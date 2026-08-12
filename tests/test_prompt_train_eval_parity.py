@@ -26,7 +26,7 @@ from src.common.dataset_base import DEFAULT_EXCLUDE_OBJECTS, _window_object
 from src.common.goal_space import DEFAULT_GOAL_KEYS, goal_vector
 from src.data.lerobot_export import goal_prompt
 
-DATASET = Path("runs/lerobot_v4")
+DATASET = Path("runs/lerobot_v5")
 TASKS = DATASET / "meta" / "tasks.parquet"
 
 
