@@ -61,7 +61,7 @@ import numpy as np  # noqa: E402
 
 from src.common.annotations import iter_windows, is_goal_frame, list_annotation_files  # noqa: E402
 from src.common.dataset_base import DEFAULT_TRAJ_ROOT  # noqa: E402
-from src.common.facing import SECTOR8, load_facing_map  # noqa: E402
+from src.common.facing import SECTOR8, load_facing_map, sector8  # noqa: E402
 from src.common.goal_space import (  # noqa: E402
     DEFAULT_GOAL_KEYS,
     DEFAULT_V5_RANGES,
@@ -139,48 +139,72 @@ def preset_goals() -> list[dict]:
     for name, cats in PRESET_CATEGORIES:
         vals, _spec = vocab.categories_to_profile(cats)
         g = {k: float(vals.get(k, 0.0)) for k in DEFAULT_GOAL_KEYS}
-        half_h, half_w = _half_extents_from_occupancy(g["occupancy"])
-        g, crop = _fit_authored_box(g, half_w, half_h)
+        g, crop = _fit_authored_box(g)
         out.append({"name": name, "goal": g, "crop": crop})
     return out
 
 
-def _half_extents_from_occupancy(occ: float) -> tuple[float, float]:
-    """Half-height / half-width in px for an authored goal that names only a shot size.
-
-    occupancy is a silhouette-area ratio; a bbox is not recoverable from it in general. This
-    inverts the crude version — subject box area = occ% of the frame at aspect 2.4:1 — purely
-    so an authored goal opens at a plausible distance. Real dataset goals never take this path.
-    """
-    area = max(1e-4, float(occ) / 100.0) * RENDER_WIDTH * RENDER_HEIGHT
-    aspect = 2.4
-    half_w = 0.5 * math.sqrt(area / aspect)
-    return half_w * aspect, half_w
+SUBJECT_ASPECT = 2.4          # a standing human's projected bbox, height over width
 
 
-def _fit_authored_box(g: dict, half_w_full: float, half_h_full: float) -> tuple[dict, dict]:
-    """Make an authored goal internally consistent under the VISIBLE-bbox convention.
+def _solve_full_box(occ_target: float, cx: float, cy: float) -> tuple[float, float]:
+    """Half-width / half-height of the FULL projection whose CLIPPED area is `occ_target`% of
+    the frame, for a subject of `SUBJECT_ASPECT` centred at (cx, cy).
 
-    A category pair like ("close-up", "centered/mid") names where the subject sits and how big
-    it is, but at occupancy 88 the subject does not FIT — so the box the goal keys describe is
-    not the box the shot size implies. Place the full projection at the requested centre, cut it
-    at the frame edges, and report the surviving box as `object_center_*` / `bbox_*_offset` with
-    the cut recorded in the crop fractions. Otherwise a "close-up" preset would claim a 1290 px
-    subject inside a 768 px frame with `uncropped` in its own prompt.
+    Solving for the clipped area rather than the full one is the whole point: the scorer defines
+    `occupancy` as clipped-bbox-area over frame-area (`src/scoring/bbox_control.py`), so sizing
+    the full box to the target instead would leave a "close-up" preset whose own bbox says
+    medium shot. Monotone in w, so bisection is exact enough.
     """
     W, H = RENDER_WIDTH, RENDER_HEIGHT
-    cy = float(g["object_center_y"])
-    y0, y1 = cy - half_h_full, cy + half_h_full
+    target = max(0.01, min(100.0, float(occ_target)))
+
+    def clipped_pct(w: float) -> float:
+        h = SUBJECT_ASPECT * w
+        vx = max(0.0, min(cx + w, W) - max(cx - w, 0.0))
+        vy = max(0.0, min(cy + h, H) - max(cy - h, 0.0))
+        return 100.0 * vx * vy / (W * H)
+
+    lo, hi = 0.5, 4.0 * W
+    for _ in range(80):
+        mid = 0.5 * (lo + hi)
+        if clipped_pct(mid) < target:
+            lo = mid
+        else:
+            hi = mid
+    w = 0.5 * (lo + hi)
+    return w, SUBJECT_ASPECT * w
+
+
+def _fit_authored_box(g: dict) -> tuple[dict, dict]:
+    """Make an authored goal internally consistent under the VISIBLE-bbox convention.
+
+    A category pair like ("close-up", "centered/mid") says where the subject sits and how much
+    frame it fills, but at occupancy 88 the subject does not FIT — so the box the goal keys
+    describe is not the box the shot size implies. Place the solved full projection at the
+    requested centre, cut it at the frame edges, and report the surviving box as
+    `object_center_*` / `bbox_*_offset`, with the vertical cut in the crop fractions and the
+    whole cut in `body_in_frame_ratio` (which the scorer defines as clipped area over full area).
+    Every key then agrees with every other one, which is what the page's controls maintain.
+    """
+    W, H = RENDER_WIDTH, RENDER_HEIGHT
+    cx, cy = float(g["object_center_x"]), float(g["object_center_y"])
+    half_w, half_h = _solve_full_box(g["occupancy"], cx, cy)
+
+    y0, y1 = cy - half_h, cy + half_h
     span = max(y1 - y0, 1e-6)
     crop = {"top": max(0.0, -y0) / span, "bot": max(0.0, y1 - H) / span}
     vy0, vy1 = max(y0, 0.0), min(y1, H)
+    vx0, vx1 = max(cx - half_w, 0.0), min(cx + half_w, W)
+
     g = dict(g)
     g["object_center_y"] = 0.5 * (vy0 + vy1)
     g["bbox_y_offset"] = max(0.5 * (vy1 - vy0), 1.0)
-    cx = float(g["object_center_x"])
-    vx0, vx1 = max(cx - half_w_full, 0.0), min(cx + half_w_full, W)
     g["object_center_x"] = 0.5 * (vx0 + vx1)
     g["bbox_x_offset"] = max(0.5 * (vx1 - vx0), 1.0)
+    g["occupancy"] = 4.0 * g["bbox_x_offset"] * g["bbox_y_offset"] / (W * H) * 100.0
+    g["body_in_frame_ratio"] = 100.0 * ((vx1 - vx0) * (vy1 - vy0)) / (4.0 * half_w * half_h)
+    crop["vis"] = (vy1 - vy0) / span
     return g, crop
 
 
@@ -328,82 +352,123 @@ def sample_real_goals(n: int, root: str, seed: int, max_placements: int = 1600) 
 # --------------------------------------------------------------------------- #
 # page
 # --------------------------------------------------------------------------- #
-def build_html(cfg: dict, goals: list[dict], initial: dict) -> str:
+def build_html(cfg: dict, goals: list[dict], initial: dict, *, fragment: bool = False) -> str:
+    """The page. `fragment=True` drops the document wrapper for hosts that supply their own
+    <head>/<body> (the Artifact renderer); the content, styles and script are identical."""
     payload = json.dumps({"cfg": cfg, "goals": goals, "initial": initial}, allow_nan=False)
-    return HTML_TEMPLATE.replace("/*__PAYLOAD__*/", payload)
+    body = HTML_FRAGMENT.replace("/*__PAYLOAD__*/", payload)
+    return body if fragment else (DOC_OPEN + body + DOC_CLOSE)
 
 
-HTML_TEMPLATE = r"""<!doctype html>
+DOC_OPEN = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Goal profile inspector — DronePhotographer v12</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"></head><body>
+"""
+DOC_CLOSE = "\n</body></html>\n"
+
+HTML_FRAGMENT = r"""<title>Goal profile inspector — DronePhotographer v12</title>
 <style>
+/* An instrument, not a document: the measuring face is monospace and carries every quantity,
+   key name and category word, so units look like units and columns of digits line up. Prose
+   (the masthead, the hints) is the only thing set in sans. Deliberately single-theme — the
+   canvases are painted dark by the renderer itself, so a light ground would leave the two
+   halves of the page disagreeing. Every colour is stated on :root, none behind a media query. */
 :root{
-  --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2b313d; --ink:#e6e9ef;
-  --dim:#98a1b3; --accent:#6ea8fe; --accent2:#ffb454; --good:#5ad19b; --bad:#ff7a7a;
+  --bg:#0e1116; --panel:#161a21; --panel2:#1d222b; --line:#272d38; --ink:#e3e8f0;
+  --dim:#8e99ad; --goal:#6ea8fe; --truth:#ffb454; --good:#5ad19b; --bad:#ff7a7a;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:ui-sans-serif,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;
 }
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);
-  font:14px/1.5 ui-sans-serif,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",sans-serif}
-header{padding:18px 22px 12px;border-bottom:1px solid var(--line)}
-h1{margin:0 0 4px;font-size:17px;font-weight:650;letter-spacing:.2px}
-header p{margin:0;color:var(--dim);font-size:12.5px;max-width:86ch}
-code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:#cbd5e6}
-.wrap{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr) 300px;gap:14px;padding:14px 22px 26px}
-@media(max-width:1400px){.wrap{grid-template-columns:minmax(0,1fr) 300px}}
+body{margin:0;background:var(--bg);color:var(--ink);font:13.5px/1.55 var(--mono);
+  font-variant-numeric:tabular-nums}
+:focus-visible{outline:2px solid var(--goal);outline-offset:2px}
+header{padding:20px 22px 14px;border-bottom:1px solid var(--line)}
+h1{margin:0 0 5px;font-size:16px;font-weight:600;letter-spacing:.4px;text-wrap:balance}
+h1 span{color:var(--dim);font-weight:400}
+header p{margin:0;color:var(--dim);font-family:var(--sans);font-size:13px;max-width:76ch}
+code{font-size:12.5px;color:#c3d3ec}
+/* state strip — the summary the page is read for, before any detail */
+.strip{display:flex;flex-wrap:wrap;gap:7px;padding:12px 22px 0}
+.chip{display:flex;align-items:baseline;gap:7px;background:var(--panel);border:1px solid var(--line);
+  border-radius:6px;padding:4px 10px;font-size:12px}
+.chip i{font-style:normal;color:var(--dim);font-size:10px;letter-spacing:.7px;text-transform:uppercase}
+.chip b{font-weight:600;color:var(--goal)}
+.chip.warn{border-color:#6b4a20;background:#241b10}
+.chip.warn b{color:var(--truth)}
+.wrap{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,1fr) 308px;gap:14px;
+  padding:12px 22px 28px;align-items:start}
+@media(max-width:1400px){.wrap{grid-template-columns:minmax(0,1fr) 308px}}
 @media(max-width:1000px){.wrap{grid-template-columns:minmax(0,1fr)}}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
-.card h2{margin:0;padding:9px 12px;font-size:12px;font-weight:600;letter-spacing:.6px;
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden;min-width:0}
+.card h2{margin:0;padding:9px 12px;font-size:11px;font-weight:600;letter-spacing:.8px;
   text-transform:uppercase;color:var(--dim);border-bottom:1px solid var(--line);
   display:flex;justify-content:space-between;align-items:center;gap:8px}
 .card .body{padding:12px}
 canvas{display:block;width:100%;border-radius:6px;background:#0b0d11;touch-action:none}
-.readout{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;font-size:12px;margin-top:10px}
-.readout b{color:var(--dim);font-weight:500}
-.readout span{font-family:ui-monospace,Menlo,monospace}
-.ctl{margin-bottom:9px}
-.ctl label{display:flex;justify-content:space-between;font-size:11.5px;color:var(--dim);gap:8px}
-.ctl label .w{color:var(--accent);font-weight:600;text-align:right}
-.ctl input[type=range]{width:100%;margin:3px 0 0;accent-color:var(--accent);height:16px}
-.ctl .v{font-family:ui-monospace,Menlo,monospace;color:var(--ink);font-size:11.5px}
-.sec{border-top:1px solid var(--line);margin:12px -12px 10px;padding:10px 12px 0}
-.sec>span{font-size:10.5px;letter-spacing:.7px;text-transform:uppercase;color:var(--dim)}
+.legend{display:flex;flex-wrap:wrap;gap:14px;margin-top:9px;font-size:11.5px;color:var(--dim)}
+.legend s{text-decoration:none;display:inline-block;width:16px;height:0;border-top:2.5px solid;
+  vertical-align:middle;margin-right:6px}
+.readout{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:3px 12px;
+  font-size:12px;margin-top:11px}
+.readout b{color:var(--dim);font-weight:400}
+.readout span{overflow-wrap:anywhere}
+.ctl{margin-bottom:10px}
+.ctl label{display:flex;justify-content:space-between;font-size:11px;color:var(--dim);gap:8px;
+  letter-spacing:.2px}
+.ctl label .w{color:var(--goal);text-align:right}
+.ctl input[type=range]{width:100%;margin:4px 0 0;accent-color:var(--goal);height:16px}
+.ctl .v{color:var(--ink);font-size:11.5px}
+.sec{border-top:1px solid var(--line);margin:14px -12px 10px;padding:11px 12px 0}
+.sec>span{font-size:10px;letter-spacing:.8px;text-transform:uppercase;color:var(--dim)}
 button{background:var(--panel2);color:var(--ink);border:1px solid var(--line);border-radius:6px;
   padding:5px 9px;font-size:11.5px;cursor:pointer;font-family:inherit}
-button:hover{border-color:var(--accent);color:#fff}
-button.on{background:#243049;border-color:var(--accent)}
+button:hover{border-color:var(--goal);color:#fff}
+button.on{background:#22304a;border-color:var(--goal)}
 .row{display:flex;flex-wrap:wrap;gap:6px}
-.prompt{background:#0b0d11;border:1px solid var(--line);border-radius:7px;padding:10px 11px;
-  font-family:ui-monospace,Menlo,monospace;font-size:12px;line-height:1.65;color:#d7e2f5;white-space:pre-wrap}
-.cats{display:flex;flex-wrap:wrap;gap:5px;margin-top:9px}
-.tag{background:var(--panel2);border:1px solid var(--line);border-radius:20px;padding:2px 9px;font-size:11px}
-.tag b{color:var(--dim);font-weight:500}
-.badge{font-size:10.5px;padding:2px 7px;border-radius:20px;border:1px solid var(--line)}
-.badge.ok{color:var(--good);border-color:#255c45}
-.badge.bad{color:var(--bad);border-color:#6b2f2f}
-.gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:10px}
-.gal{background:var(--panel2);border:1px solid var(--line);border-radius:8px;overflow:hidden;cursor:pointer}
-.gal:hover{border-color:var(--accent)}
-.gal.on{border-color:var(--accent2)}
+.prompt{background:#0b0d11;border:1px solid var(--line);border-radius:7px;padding:12px 13px;
+  font-size:12.5px;line-height:1.7;color:#d3e0f4;white-space:pre-wrap;overflow-wrap:anywhere}
+.cats{display:flex;flex-wrap:wrap;gap:5px;margin-top:10px}
+.tag{background:var(--panel2);border:1px solid var(--line);border-radius:20px;padding:2px 10px;font-size:11.5px}
+.tag i{font-style:normal;color:var(--dim);margin-right:5px}
+.badge{font-size:10.5px;padding:2px 8px;border-radius:20px;border:1px solid var(--line);
+  letter-spacing:.3px;white-space:nowrap}
+.badge.ok{color:var(--good);border-color:#255c45;background:#0f2019}
+.badge.bad{color:var(--bad);border-color:#6b2f2f;background:#241214}
+.gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(184px,1fr));gap:10px}
+.gal{background:var(--panel2);border:1px solid var(--line);border-radius:8px;overflow:hidden;
+  cursor:pointer;text-align:left;padding:0;color:inherit;font-family:inherit}
+.gal:hover{border-color:var(--goal)}
+.gal[aria-pressed="true"]{border-color:var(--truth);box-shadow:inset 0 0 0 1px var(--truth)}
 .gal img{width:100%;display:block;aspect-ratio:4/3;object-fit:cover}
-.gal div{padding:6px 8px;font-size:10.5px;color:var(--dim);line-height:1.35;
+.gal .t{padding:6px 8px 1px;font-size:11px;color:var(--ink);
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.hint{color:var(--dim);font-size:11px;margin-top:8px}
-.err{color:var(--bad)}
-</style></head><body>
+.gal .s{padding:0 8px 7px;font-size:10.5px;color:var(--dim)}
+.hint{color:var(--dim);font-family:var(--sans);font-size:12px;margin-top:9px;max-width:84ch}
+.err{color:var(--bad);font-family:var(--mono)}
+@media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
 <header>
-  <h1>Goal profile inspector <span style="color:var(--dim);font-weight:400">· DronePhotographer v12</span></h1>
-  <p>A goal reaches the policy only as a sentence. But the 8 profile keys plus the crop fractions
-     pin the camera to 5 geometric DOF, so the same goal can be drawn: where the camera stands
-     around the subject, and what the frame looks like from there. Distances are in <b>subject
-     heights</b>. Drag the 3D view to orbit, scroll to zoom.</p>
+  <h1>Goal profile inspector <span>· DronePhotographer v12</span></h1>
+  <p>The policy is told what shot to take in one sentence, and a sentence is hard to check. But a
+     goal profile — 8 numbers plus how the frame cuts the subject — pins the camera down to five
+     geometric degrees of freedom, so the same goal can be <em>drawn</em>: where the camera stands
+     around the subject, and what it sees from there. Distances are in <b>subject heights</b>.
+     Drag the 3D view to orbit, scroll to zoom, or load one of the real dataset goals below.</p>
 </header>
+<div class="strip" id="strip"></div>
 <div class="wrap">
 
   <section class="card">
     <h2>Camera in the subject frame <span id="dist3d" class="badge"></span></h2>
     <div class="body">
       <canvas id="c3d" width="1180" height="720"></canvas>
+      <div class="legend">
+        <span><s style="border-color:#6ea8fe"></s>reconstructed from the goal</span>
+        <span id="legTruth" style="display:none"><s style="border-color:#ffb454"></s>the frame's
+          actual camera</span>
+        <span><s style="border-color:#8f9bb3"></s>subject, facing +X</span>
+      </div>
       <div class="row" style="margin-top:10px">
         <button id="tFrustum" class="on">frustum</button>
         <button id="tAxis" class="on">optical axis</button>
@@ -423,7 +488,9 @@ button.on{background:#243049;border-color:var(--accent)}
       <div class="hint">Solid blue box = the <b>visible</b> bbox the goal keys describe; the dot is
         <code>object_center_x/y</code>. Dashed orange = the full unclipped projection, and the
         orange cross is where the subject's real centre lands — the point the camera aims at.
-        The shaded bands are what the frame cuts.</div>
+        The shaded bands are what the frame cuts. Six of the eight keys change this picture;
+        <code>cam_to_obj_elevation_deg</code> moves the camera without changing the framing, so
+        it only shows in the 3D view.</div>
     </div>
   </section>
 
@@ -446,9 +513,11 @@ button.on{background:#243049;border-color:var(--accent)}
       id="galCount"></span></h2>
     <div class="body">
       <div class="gallery" id="gallery"></div>
-      <div class="hint">Every frame here passes <code>is_goal_frame</code> — the real training
-        gate. Click one to load its profile; the 3D view then also draws its <b>true</b> camera
-        pose, so the reconstruction can be checked against the pose it came from.</div>
+      <div class="hint">Every frame here passes <code>is_goal_frame</code>, the real training gate,
+        and the set is balanced across the eight view sectors. Pick one to load its profile: the
+        3D view then also draws that frame's <b>actual</b> camera, so the reconstruction can be
+        checked against the pose it was derived from, and the prompt is compared against the
+        string Python produced for the same frame.</div>
     </div>
   </section>
 </div>
@@ -554,12 +623,40 @@ function reconstruct(g, crop){
   // it is only biased for a subject cut by the LEFT or RIGHT edge.)
   const y0f=(g.object_center_y-g.bbox_y_offset)-crop.top*spanFull;
   const cyFull=y0f+spanFull/2, y1f=y0f+spanFull;
-  const ax=Math.atan((g.object_center_x-W/2)/fx), ay=Math.atan((cyFull-H/2)/fy);
+  // Horizontally there is no crop fraction — but there is `body_in_frame_ratio`, which is the
+  // clipped bbox area over the FULL projected area (src/scoring/bbox_control.py). Dividing out
+  // the vertical share leaves the horizontal one, and the side being cut is the frame edge the
+  // visible box is touching. Measured: on the frames that are cut left or right this brings the
+  // optical axis from 2.2 deg of the true pose to 0.9 deg. Only applied when a cut is actually
+  // indicated, because on uncropped frames the integer rounding in body_in_frame would inject
+  // noise into a quantity that is otherwise exact.
+  const hvis=clamp((g.body_in_frame_ratio/100)/Math.max(vis,1e-6),0.05,1);
+  const touchL=(g.object_center_x-g.bbox_x_offset)<=1, touchR=(g.object_center_x+g.bbox_x_offset)>=W-1;
+  const hcut=hvis<0.98&&(touchL||touchR);
+  const wFull=hcut?2*g.bbox_x_offset/hvis:2*g.bbox_x_offset;
+  const extra=wFull-2*g.bbox_x_offset;
+  let x0f=g.object_center_x-g.bbox_x_offset-(touchL&&touchR?extra/2:(touchL?extra:0));
+  const x1f=x0f+wFull, cxFull=x0f+wFull/2;
+  const ax=Math.atan((cxFull-W/2)/fx), ay=Math.atan((cyFull-H/2)/fy);
   const fr=aimFrame(norm(mul(cam,-1)), ax, ay);
   // What profile_to_geometry() would decode from the VISIBLE bbox — equal to r only when
   // nothing is cropped, because that decode reads the clipped half-height as if it were full.
   const rDecode=(0.5*fy)/Math.max(g.bbox_y_offset,1e-3);
-  return {r,cam,ax,ay,oyFull,rDecode,vis,spanFull,y0f,y1f,cyFull,...fr};
+  return {r,cam,ax,ay,oyFull,rDecode,vis,spanFull,y0f,y1f,cyFull,
+          hvis,hcut,wFull,x0f,x1f,cxFull,...fr};
+}
+/* occupancy is not an independent key: the scorer defines it as the CLIPPED bbox area over the
+   frame area, so it is exactly this expression of the two half-extents (checked against 32 real
+   goals: max discrepancy 0.54, which is the integer rounding). The page therefore keeps them in
+   sync rather than letting a slider assert a size the box contradicts. */
+const occupancyOf=(ox,oy)=>4*ox*oy/(C.render_w*C.render_h)*100;
+/* The visible box is symmetric about its own centre and cannot leave the frame, so the centre
+   position caps how large the box — and hence the occupancy — can be. */
+function enforceGeometry(){
+  const g=STATE.goal,W=C.render_w,H=C.render_h;
+  g.bbox_x_offset=clamp(g.bbox_x_offset,2,Math.max(2,Math.min(g.object_center_x,W-g.object_center_x)));
+  g.bbox_y_offset=clamp(g.bbox_y_offset,2,Math.max(2,Math.min(g.object_center_y,H-g.object_center_y)));
+  g.occupancy=clamp(occupancyOf(g.bbox_x_offset,g.bbox_y_offset),0,100);
 }
 
 /* --------------------------------------------------------------- 3D scene */
@@ -744,8 +841,7 @@ function paint2d(){
   // Fit the frame AND whatever spills out of it. A fixed margin is enough for a mild crop and
   // useless for a close-up whose subject is twice the frame's height — and that is exactly the
   // case worth looking at.
-  const bx0=Math.min(0,g.object_center_x-g.bbox_x_offset)-20;
-  const bx1=Math.max(W,g.object_center_x+g.bbox_x_offset)+20;
+  const bx0=Math.min(0,rec.x0f)-20, bx1=Math.max(W,rec.x1f)+20;
   const by0=Math.min(0,rec.y0f)-20, by1=Math.max(H,rec.y1f)+20;
   const S2=Math.min(0.74, 1024/(bx1-bx0), 768/(by1-by0));
   const OX2=(1024-(bx1-bx0)*S2)/2-bx0*S2, OY2=(768-(by1-by0)*S2)/2-by0*S2;
@@ -757,13 +853,17 @@ function paint2d(){
   else { g2.fillStyle="#11151c"; g2.fillRect(fx0,fy0,fw,fh); }
 
   const cx=g.object_center_x, cy=g.object_center_y, ox=g.bbox_x_offset, oy=g.bbox_y_offset;
-  const y0f=rec.y0f, y1f=rec.y1f, bh=y1f-y0f, hw=ox;
+  const y0f=rec.y0f, y1f=rec.y1f, bh=y1f-y0f, hw=rec.wFull/2, cxf=rec.cxFull;
   // The regions the frame cuts away, laid down FIRST so the silhouette still reads through them.
   g2.fillStyle="rgba(255,122,122,0.17)";
-  if(crop.top>0.001) g2.fillRect(tx(cx-hw)-6,ty(y0f),ts(2*hw)+12,ts(-y0f));
-  if(crop.bot>0.001) g2.fillRect(tx(cx-hw)-6,ty(H),ts(2*hw)+12,ts(y1f-H));
+  if(crop.top>0.001) g2.fillRect(tx(rec.x0f)-6,ty(y0f),ts(rec.wFull)+12,ts(-y0f));
+  if(crop.bot>0.001) g2.fillRect(tx(rec.x0f)-6,ty(H),ts(rec.wFull)+12,ts(y1f-H));
+  if(rec.hcut){
+    if(rec.x0f<-0.5) g2.fillRect(tx(rec.x0f),ty(y0f)-6,ts(-rec.x0f),ts(bh)+12);
+    if(rec.x1f>W+0.5) g2.fillRect(tx(W),ty(y0f)-6,ts(rec.x1f-W),ts(bh)+12);
+  }
   // subject silhouette, drawn across the FULL projection so the cut ends land in the margin
-  const U=u=>tx(cx+u*hw), V=v=>ty(y0f+v*bh);
+  const U=u=>tx(cxf+u*hw), V=v=>ty(y0f+v*bh);
   // A real render underneath is the better evidence, so the silhouette thins out to an outline
   // rather than covering it. Without an image it fills, because then it is all there is.
   g2.fillStyle=STATE.image?"rgba(110,168,254,0.05)":"rgba(110,168,254,0.20)";
@@ -773,6 +873,26 @@ function paint2d(){
               [-0.06,0.62],[0.06,0.62],[0.12,1],[0.66,1],[0.62,0.55],[0.86,0.32],[1,0.22],[0.22,0.135]];
   g2.beginPath(); BODY.forEach((p,i)=>i?g2.lineTo(U(p[0]),V(p[1])):g2.moveTo(U(p[0]),V(p[1])));
   g2.closePath(); g2.fill(); g2.stroke();
+  // Which way the subject faces IN THE IMAGE. At bearing 90 the camera's right axis lines up
+  // with the facing direction, so the subject reads as facing image-right (src/common/facing.py);
+  // 0 is face-on and 180 is the back of the head. This is the frame's half of the bearing key.
+  const bear=g[BKEY]*D2R, faceX=Math.sin(bear), toward=Math.cos(bear);
+  const hx=ts(hw*0.32), hy=ts(bh*0.065), hcx=U(0), hcy=V(0.065);
+  g2.fillStyle="rgba(110,168,254,0.9)";
+  if(toward>0.15){                                   // eyes: the subject is looking our way
+    for(const s of [-0.42,0.42]){
+      g2.beginPath(); g2.arc(hcx+hx*(0.55*faceX+s*Math.max(toward,0.25)),hcy-hy*0.12,
+                             Math.max(1.4,hx*0.11),0,7); g2.fill();
+    }
+  } else if(toward<-0.15){                           // back of the head — no face to show
+    g2.strokeStyle="rgba(110,168,254,0.5)"; g2.lineWidth=1.5;
+    g2.beginPath(); g2.ellipse(hcx,hcy,hx*0.55,hy*0.55,0,0,7); g2.stroke();
+  }
+  if(Math.abs(faceX)>0.12){                          // nose, on the side the subject turns to
+    g2.beginPath(); g2.moveTo(hcx+hx*0.72*Math.sign(faceX),hcy-hy*0.18);
+    g2.lineTo(hcx+hx*(0.72+0.45*Math.abs(faceX))*Math.sign(faceX),hcy+hy*0.06);
+    g2.lineTo(hcx+hx*0.72*Math.sign(faceX),hcy+hy*0.3); g2.closePath(); g2.fill();
+  }
 
   // thirds, inside the frame only
   g2.strokeStyle="rgba(255,255,255,0.16)"; g2.lineWidth=1.5;
@@ -781,7 +901,7 @@ function paint2d(){
     g2.moveTo(fx0,ty(H*i/3));g2.lineTo(fx0+fw,ty(H*i/3));g2.stroke();});
   // full bbox (dashed) then visible bbox (solid)
   g2.setLineDash([9,7]); g2.strokeStyle="rgba(255,180,84,0.9)"; g2.lineWidth=2;
-  g2.strokeRect(tx(cx-ox),ty(y0f),ts(2*ox),ts(bh)); g2.setLineDash([]);
+  g2.strokeRect(tx(rec.x0f),ty(y0f),ts(rec.wFull),ts(bh)); g2.setLineDash([]);
   g2.strokeStyle="#6ea8fe"; g2.lineWidth=3;
   g2.strokeRect(tx(cx-ox),ty(cy-oy),ts(2*ox),ts(2*oy));
   // the frame edge itself — the thing doing the cutting
@@ -793,12 +913,13 @@ function paint2d(){
   g2.fillStyle="#6ea8fe"; g2.beginPath(); g2.arc(tx(cx),ty(cy),6,0,7); g2.fill();
   // Where the subject's TRUE centre projects. It is what the camera aims at, and on a cropped
   // shot it is not object_center_y — that key names the centre of the clipped box.
-  if(Math.abs(rec.cyFull-cy)>2){
+  if(Math.abs(rec.cyFull-cy)>2||Math.abs(rec.cxFull-cx)>2){
     g2.strokeStyle="#ffb454"; g2.lineWidth=2.5; g2.beginPath();
-    g2.moveTo(tx(cx)-11,ty(rec.cyFull)); g2.lineTo(tx(cx)+11,ty(rec.cyFull));
-    g2.moveTo(tx(cx),ty(rec.cyFull)-11); g2.lineTo(tx(cx),ty(rec.cyFull)+11); g2.stroke();
+    g2.moveTo(tx(rec.cxFull)-11,ty(rec.cyFull)); g2.lineTo(tx(rec.cxFull)+11,ty(rec.cyFull));
+    g2.moveTo(tx(rec.cxFull),ty(rec.cyFull)-11); g2.lineTo(tx(rec.cxFull),ty(rec.cyFull)+11);
+    g2.stroke();
     g2.setLineDash([3,5]); g2.strokeStyle="rgba(255,180,84,0.65)"; g2.lineWidth=2;
-    g2.beginPath(); g2.moveTo(tx(cx),ty(cy)); g2.lineTo(tx(cx),ty(rec.cyFull)); g2.stroke();
+    g2.beginPath(); g2.moveTo(tx(cx),ty(cy)); g2.lineTo(tx(rec.cxFull),ty(rec.cyFull)); g2.stroke();
     g2.setLineDash([]);
   }
   g2.font="600 21px ui-sans-serif,sans-serif"; g2.textBaseline="middle"; g2.textAlign="left";
@@ -832,6 +953,23 @@ function render(){
 
   const el=g.cam_to_obj_elevation_deg;
   document.getElementById("dist3d").textContent=`${rec.r.toFixed(2)} subject heights`;
+  document.getElementById("legTruth").style.display=STATE.truth?"":"none";
+
+  // state strip: the five things that decide the shot, before any of the detail below
+  const chips=[
+    ["shot", classify(g.occupancy,C.tables.SHOT_SIZE)],
+    ["seen from", sector8(g[BKEY])],
+    ["angle", classify(el,C.tables.ELEVATION)],
+    ["range", `${rec.r.toFixed(2)} h`],
+    ["framing", cropPhrase(crop.top,crop.bot)],
+  ];
+  // Elevation is measured from the subject's CENTRE, so a steep angle close in puts the camera
+  // under the floor. Worth flagging in form, not just in a number.
+  const warn=rec.cam[2]<-0.5;
+  document.getElementById("strip").innerHTML=
+    chips.map(([k,v])=>`<span class="chip"><i>${k}</i><b>${v}</b></span>`).join("")
+    +(warn?`<span class="chip warn"><i>unreachable</i><b>camera is `
+      +`${(-0.5-rec.cam[2]).toFixed(2)} h below the ground</b></span>`:"");
   const rows=[
     ["bearing", `${rec.bearing.toFixed(1)}° · ${sector8(rec.bearing)}`],
     ["elevation", `${el.toFixed(1)}° · camera ${el<0?"above":(el>0?"below":"level with")} subject`],
@@ -862,19 +1000,30 @@ function render(){
     rows.map(([a,b])=>`<b>${a}</b><span>${b}</span>`).join("");
 
   const vis=rec.vis;
-  document.getElementById("geom2d").innerHTML=[
+  const rows2=[
     ["visible bbox", `x ${(g.object_center_x-g.bbox_x_offset).toFixed(0)}–`
       +`${(g.object_center_x+g.bbox_x_offset).toFixed(0)}, y `
       +`${(g.object_center_y-g.bbox_y_offset).toFixed(0)}–${(g.object_center_y+g.bbox_y_offset).toFixed(0)} px`],
-    ["crop", `${cropPhrase(crop.top,crop.bot)} · visible ${vis.toFixed(2)} `
-      +`(top ${crop.top.toFixed(2)} / bottom ${crop.bot.toFixed(2)})`],
-    ["occupancy", `${g.occupancy.toFixed(0)}% of frame area · body in frame ${g.body_in_frame_ratio.toFixed(0)}%`],
-  ].map(([a,b])=>`<b>${a}</b><span>${b}</span>`).join("");
+    ["vertical cut", `${cropPhrase(crop.top,crop.bot)} · ${(100*vis).toFixed(0)}% of the height `
+      +`in frame (top ${crop.top.toFixed(2)} / bottom ${crop.bot.toFixed(2)})`],
+    ["occupancy", `${g.occupancy.toFixed(1)}% of frame area — the bbox area, `
+      +`4·${g.bbox_x_offset.toFixed(0)}·${g.bbox_y_offset.toFixed(0)}/(1024·768)`],
+  ];
+  if(rec.hcut) rows2.push(["horizontal cut",
+    `${(100*(1-rec.hvis)).toFixed(0)}% of the width is off the `
+    +`${rec.x0f<-0.5&&rec.x1f>C.render_w+0.5?"left and right":(rec.x0f<-0.5?"left":"right")} edge, `
+    +`recovered from body_in_frame ÷ vertical share`]);
+  else if(g.body_in_frame_ratio/100 < vis-0.02) rows2.push(["inconsistent",
+    `body_in_frame ${g.body_in_frame_ratio.toFixed(0)}% is below the `
+    +`${(100*vis).toFixed(0)}% the vertical cut alone allows, which needs a side cut — but the `
+    +`bbox does not touch a side edge. No camera produces this goal.`]);
+  document.getElementById("geom2d").innerHTML=
+    rows2.map(([a,b])=>`<b>${a}</b><span>${b}</span>`).join("");
 
   const jsPrompt=goalPrompt(g,crop);
   document.getElementById("prompt").textContent=jsPrompt;
   document.getElementById("cats").innerHTML=Object.entries(categories(g,crop))
-    .map(([k,v])=>`<span class="tag"><b>${k}</b> ${v}</span>`).join("");
+    .map(([k,v])=>`<span class="tag"><i>${k}</i>${v}</span>`).join("");
   const badge=document.getElementById("parity"), msg=document.getElementById("parityMsg");
   if(STATE.pyPrompt){
     const ok=STATE.pyPrompt===jsPrompt;
@@ -891,18 +1040,31 @@ function render(){
 
 /* --------------------------------------------------------------- controls */
 const SLIDERS=[
-  ["occupancy","occupancy %",0,100,1,g=>classify(g.occupancy,C.tables.SHOT_SIZE)],
+  ["occupancy","occupancy % — resizes the bbox",0,100,0.5,g=>classify(g.occupancy,C.tables.SHOT_SIZE)],
   [BKEY,"subject bearing °",0,359,1,g=>sector8(g[BKEY])],
   ["cam_to_obj_elevation_deg","elevation ° (− = camera above)",-90,90,1,
     g=>classify(g.cam_to_obj_elevation_deg,C.tables.ELEVATION)],
-  ["object_center_x","object_center_x px",-200,1224,1,
+  ["object_center_x","object_center_x px",0,1024,1,
     g=>classify(g.object_center_x/C.render_w,C.tables.PLACE_X)],
-  ["object_center_y","object_center_y px",-200,968,1,
+  ["object_center_y","object_center_y px",0,768,1,
     g=>classify(g.object_center_y/C.render_h,C.tables.PLACE_Y)],
-  ["bbox_x_offset","bbox_x_offset px (half width)",5,1200,1,null],
-  ["bbox_y_offset","bbox_y_offset px (half height)",5,1200,1,null],
-  ["body_in_frame_ratio","body_in_frame %",0,100,1,g=>classify(g.body_in_frame_ratio,C.tables.BODY_FRAMING)],
+  ["bbox_x_offset","bbox_x_offset px (half width)",2,512,1,null],
+  ["bbox_y_offset","bbox_y_offset px (half height)",2,384,1,null],
+  ["body_in_frame_ratio","body_in_frame % — sets the side cut",1,100,1,
+    g=>classify(g.body_in_frame_ratio,C.tables.BODY_FRAMING)],
 ];
+/* One key's slider movement, applied to the goal. Split out of the event handler so the effect
+   of every key can be exercised without a DOM. */
+function applySlider(key,v){
+  const g=STATE.goal;
+  if(key==="occupancy"){
+    // occupancy IS the bbox area, so asking for more of it is asking for a bigger box; the
+    // aspect ratio is preserved because nothing else in the goal says how it should change.
+    const s=Math.sqrt(Math.max(v,0.05)/Math.max(occupancyOf(g.bbox_x_offset,g.bbox_y_offset),0.05));
+    g.bbox_x_offset*=s; g.bbox_y_offset*=s;
+  } else { g[key]=v; }
+  enforceGeometry();
+}
 function buildControls(){
   const host=document.getElementById("controls"); host.innerHTML="";
   SLIDERS.forEach(([key,label,lo,hi,step,word])=>{
@@ -912,8 +1074,9 @@ function buildControls(){
       +`<div class="v" data-v="${key}"></div>`;
     host.appendChild(d);
     d.querySelector("input").addEventListener("input",e=>{
-      STATE.goal[key]=+e.target.value; STATE.pyPrompt=null; STATE.active=-1;
-      document.querySelectorAll(".gal").forEach(x=>x.classList.remove("on"));
+      applySlider(key,+e.target.value);
+      STATE.pyPrompt=null; STATE.active=-1;
+      document.querySelectorAll(".gal").forEach(x=>x.setAttribute("aria-pressed","false"));
       syncControls(); render();
     });
   });
@@ -927,8 +1090,15 @@ function buildControls(){
       +`<div class="v" data-v="crop_${k}"></div>`;
     host.appendChild(d);
     d.querySelector("input").addEventListener("input",e=>{
-      STATE.crop[k]=Math.min(+e.target.value,0.97-STATE.crop[k==="top"?"bot":"top"]);
-      STATE.crop.vis=null;            // hand-edited crop: recompute visible_frac from the pair
+      const g=STATE.goal, crop=STATE.crop;
+      const visOld=crop.vis!=null?crop.vis:(1-crop.top-crop.bot);
+      // body_in_frame is the clipped/full AREA ratio, so it is the vertical share times the
+      // horizontal one. Cutting more off the top has to change it; hold the horizontal share
+      // fixed (this slider says nothing about the sides) and let the vertical share carry it.
+      const hv=clamp((g.body_in_frame_ratio/100)/Math.max(visOld,1e-6),0.05,1);
+      crop[k]=Math.min(+e.target.value,0.97-crop[k==="top"?"bot":"top"]);
+      crop.vis=null;                  // hand-edited crop: recompute visible_frac from the pair
+      g.body_in_frame_ratio=clamp(100*(1-crop.top-crop.bot)*hv,1,100);
       STATE.pyPrompt=null; syncControls(); render();
     });
   });
@@ -963,11 +1133,13 @@ function buildGallery(){
   document.getElementById("galCount").textContent=`${GOALS.length} frames`;
   const host=document.getElementById("gallery");
   GOALS.forEach((s,i)=>{
-    const d=document.createElement("div"); d.className="gal";
-    d.innerHTML=`<img src="${s.image}" loading="lazy"><div>${s.name}</div>`;
+    const d=document.createElement("button"); d.className="gal";
+    d.type="button"; d.setAttribute("aria-pressed","false");
+    d.innerHTML=`<img src="${s.image}" alt="${s.sub}" loading="lazy">`
+      +`<div class="t">${s.name}</div><div class="s">${s.sub}</div>`;
     d.onclick=()=>{
-      document.querySelectorAll(".gal").forEach(x=>x.classList.remove("on"));
-      d.classList.add("on"); STATE.active=i;
+      document.querySelectorAll(".gal").forEach(x=>x.setAttribute("aria-pressed","false"));
+      d.setAttribute("aria-pressed","true"); STATE.active=i;
       setGoal(s.goal,s.crop,{truth:s.truth,prompt:s.prompt,image:s.image});
     };
     host.appendChild(d);
@@ -992,7 +1164,7 @@ document.getElementById("tReset").onclick=()=>{frameView(); paint();};
 buildControls(); buildGallery();
 setGoal(DATA.initial.goal, DATA.initial.crop, DATA.initial.opts||{});
 frameView(); paint();
-</script></body></html>
+</script>
 """
 
 
@@ -1009,6 +1181,9 @@ def main() -> int:
                     help="seed from a JSON dict of raw profile values")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default=OUT_DEFAULT)
+    ap.add_argument("--fragment", action="store_true",
+                    help="emit without the document wrapper, for a host that supplies its own "
+                         "<head>/<body> (the Artifact renderer)")
     args = ap.parse_args()
 
     presets = preset_goals()
@@ -1019,8 +1194,7 @@ def main() -> int:
         gp = language_to_goal(args.nl, keyword_classifier)
         g = dict(presets[1]["goal"])
         g.update({k: float(v) for k, v in gp.values.items() if k in DEFAULT_GOAL_KEYS})
-        half_h, half_w = _half_extents_from_occupancy(g["occupancy"])
-        initial["goal"], initial["crop"] = _fit_authored_box(g, half_w, half_h)
+        initial["goal"], initial["crop"] = _fit_authored_box(g)
         unspecified = [k for k in DEFAULT_GOAL_KEYS if k not in gp.specified]
         print(f'NL "{args.nl}" -> {gp.categories()}')
         if unspecified:
@@ -1034,7 +1208,7 @@ def main() -> int:
     if goals:
         print(f"sampled {len(goals)} real goal frames")
 
-    html = build_html(page_config(), goals, initial)
+    html = build_html(page_config(), goals, initial, fragment=args.fragment)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(html, encoding="utf-8")

@@ -65,23 +65,38 @@ def test_preset_goals_are_consistent_with_the_visible_bbox_convention(preset):
     assert crop["top"] + crop["bot"] < 1.0
 
 
-def test_fit_authored_box_records_the_cut_it_makes():
-    # a subject twice the frame's height, centred: half cut off each end
+def _centred(occ: float) -> dict:
     g = {k: 0.0 for k in DEFAULT_GOAL_KEYS}
     g["object_center_x"], g["object_center_y"] = RENDER_WIDTH / 2, RENDER_HEIGHT / 2
-    fitted, crop = viz._fit_authored_box(g, 100.0, RENDER_HEIGHT)
-    assert crop["top"] == pytest.approx(0.25) and crop["bot"] == pytest.approx(0.25)
-    assert fitted["bbox_y_offset"] == pytest.approx(RENDER_HEIGHT / 2)
-    assert crop_phrase(crop["top"], crop["bot"]) == "cropped at both the head and the feet"
+    g["occupancy"] = occ
+    return g
 
 
-def test_fit_authored_box_leaves_a_fitting_subject_alone():
-    g = {k: 0.0 for k in DEFAULT_GOAL_KEYS}
-    g["object_center_x"], g["object_center_y"] = RENDER_WIDTH / 2, RENDER_HEIGHT / 2
-    fitted, crop = viz._fit_authored_box(g, 100.0, 200.0)
-    assert crop == {"top": 0.0, "bot": 0.0}
-    assert fitted["bbox_y_offset"] == pytest.approx(200.0)
+@pytest.mark.parametrize("occ", [4.0, 14.0, 29.0, 48.0, 68.0, 88.0])
+def test_fit_authored_box_hits_the_requested_occupancy(occ):
+    # occupancy is the CLIPPED bbox area over the frame area, so the fitted box must reproduce
+    # the request even when the subject overflows the frame and part of that box is cut away.
+    fitted, _crop = viz._fit_authored_box(_centred(occ))
+    assert fitted["occupancy"] == pytest.approx(occ, abs=0.05)
+    assert 4 * fitted["bbox_x_offset"] * fitted["bbox_y_offset"] / (
+        RENDER_WIDTH * RENDER_HEIGHT) * 100 == pytest.approx(occ, abs=0.05)
+
+
+def test_fit_authored_box_leaves_a_fitting_subject_uncropped():
+    fitted, crop = viz._fit_authored_box(_centred(14.0))       # a wide shot fits easily
+    assert (crop["top"], crop["bot"]) == (0.0, 0.0)
+    assert crop["vis"] == pytest.approx(1.0)
+    assert fitted["body_in_frame_ratio"] == pytest.approx(100.0)
     assert fitted["object_center_y"] == pytest.approx(RENDER_HEIGHT / 2)
+
+
+def test_fit_authored_box_records_the_cut_it_makes():
+    fitted, crop = viz._fit_authored_box(_centred(88.0))       # a close-up cannot fit
+    assert crop["top"] > 0.02 and crop["bot"] > 0.02
+    assert crop_phrase(crop["top"], crop["bot"]) == "cropped at both the head and the feet"
+    assert crop["top"] + crop["bot"] + crop["vis"] == pytest.approx(1.0)
+    # body_in_frame is the clipped/full AREA ratio, so it is the product of the two shares
+    assert fitted["body_in_frame_ratio"] < 100.0 * crop["vis"] + 1e-6
 
 
 def test_built_page_is_self_contained_and_carries_a_parsable_payload():
