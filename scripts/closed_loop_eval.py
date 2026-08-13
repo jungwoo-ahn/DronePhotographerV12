@@ -134,7 +134,7 @@ from src.common.goal_space import (  # noqa: E402
 )
 from src.common.reward import CameraIntrinsics, pose_to_geometry, _geometry_distance  # noqa: E402
 from src.common.run_info import write_run_info as _write_run_info  # noqa: E402
-from src.data.cosmos_camera_dataset import CAMERA_ACTION_DIM  # noqa: E402
+from src.data.cosmos_camera_dataset import CAMERA_ACTION_DIM, DOMAIN_NAME  # noqa: E402
 from src.data.lerobot_export import goal_prompt  # noqa: E402
 
 SECTOR_ORDER = ("front", "front-right", "right", "back-right",
@@ -195,7 +195,7 @@ def make_prompt(goal_vec: np.ndarray, crop=None) -> str:
 
 
 def predict_chunk(model, frame_uint8: np.ndarray, prompt: str, seed: int) -> np.ndarray:
-    """One 8x9 action chunk from the current observation + goal prompt.
+    """One (chunk_size, CAMERA_ACTION_DIM) action chunk: 9 pose dims + shoot on dim 9.
 
     The batch is rebuilt every call on purpose: the model normalizes video in place
     and stamps `is_preprocessed`, so a reused dict silently takes the float branch.
@@ -208,7 +208,7 @@ def predict_chunk(model, frame_uint8: np.ndarray, prompt: str, seed: int) -> np.
         raw_action_dim=CAMERA_ACTION_DIM,
         prompt=prompt,
         view_point="ego_view",
-        domain_name="camera_pose",
+        domain_name=DOMAIN_NAME,
         # ModelMode, not the bare string: `build_action_batch` reads `model_mode.value`.
         # ModelMode is a StrEnum, so "policy" compares equal and every type check passes
         # — it only blows up inside the builder, once per episode.
@@ -223,7 +223,11 @@ def predict_chunk(model, frame_uint8: np.ndarray, prompt: str, seed: int) -> np.
         out = model.generate_samples_from_batch(
             batch, guidance=args.guidance, num_steps=args.num_steps, seed=[seed],
         )
-    return out["action"][0].float().cpu().numpy()[:, :9]
+    # Slice to the FULL action width, not 9. Truncating here dropped the shoot channel
+    # before the caller ever saw it, and the caller's `if chunk.shape[1] > 9` guard then
+    # quietly read 0.0 forever -- termination would simply never fire, with nothing in the
+    # log to say why. Same silent-fallback shape as the diagnostics collector bug.
+    return out["action"][0].float().cpu().numpy()[:, :CAMERA_ACTION_DIM]
 
 
 def geometry_distance(position, forward, up, goal_view, intr) -> float:
@@ -483,7 +487,10 @@ def main() -> int:
                 # the point of the 10th dim — the policy DECLARES arrival, because action
                 # magnitude cannot be thresholded for it: the final chunk moves as much as
                 # the previous one (0.31 vs 0.25, docs/v4_session_changes.md section 11).
-                shoot = float(np.max(chunk[:, 9])) if chunk.shape[1] > 9 else 0.0
+                assert chunk.shape[1] == CAMERA_ACTION_DIM, (
+                    f"predicted chunk is {chunk.shape[1]} wide, expected "
+                    f"{CAMERA_ACTION_DIM}; the shoot channel is missing")
+                shoot = float(np.max(chunk[:, 9]))
                 if declared_stop is None and shoot > args.shoot_threshold:
                     declared_stop = c
                     if args.stop_on_shoot:

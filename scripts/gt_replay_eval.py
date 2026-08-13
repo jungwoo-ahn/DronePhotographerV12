@@ -117,7 +117,7 @@ from src.common.goal_space import (  # noqa: E402
 )
 from src.common.reward import pose_to_geometry, _geometry_distance  # noqa: E402
 from src.common.run_info import write_run_info  # noqa: E402
-from src.data.cosmos_camera_dataset import CAMERA_ACTION_DIM  # noqa: E402
+from src.data.cosmos_camera_dataset import CAMERA_ACTION_DIM, DOMAIN_NAME  # noqa: E402
 from src.data.lerobot_export import goal_prompt  # noqa: E402
 from src.utils.rotation_utils import matrix_from_rot6d  # noqa: E402
 
@@ -281,7 +281,7 @@ def predict_chunks(model, frame_uint8: np.ndarray, prompt: str, seed: int,
             raw_action_dim=CAMERA_ACTION_DIM, prompt=prompt, view_point="ego_view",
             # ModelMode, not "policy": the builder reads `model_mode.value`, and the
             # StrEnum compares equal to the string so nothing catches it earlier.
-            domain_name="camera_pose", model_mode=ModelMode.POLICY,
+            domain_name=DOMAIN_NAME, model_mode=ModelMode.POLICY,
             action_chunk_size=args.chunk_size, fps=args.fps,
             input_video_key=model.config.input_video_key, batch_size=1, device="cuda",
         )
@@ -289,7 +289,7 @@ def predict_chunks(model, frame_uint8: np.ndarray, prompt: str, seed: int,
             res = model.generate_samples_from_batch(
                 batch, guidance=args.guidance, num_steps=args.num_steps, seed=[seed + j],
             )
-        out.append(res["action"][0].float().cpu().numpy()[:, :9])
+        out.append(res["action"][0].float().cpu().numpy()[:, :CAMERA_ACTION_DIM])
     return np.stack(out)
 
 
