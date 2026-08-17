@@ -37,6 +37,7 @@ import numpy as np
 # Imported up here, ahead of the torch/cosmos block below, purely so the `--root` default
 # can reference it — the rest of the src imports stay after argparse to keep `--help` fast.
 from src.common.dataset_base import DEFAULT_TRAJ_ROOT  # noqa: E402
+from src.data.cosmos_camera_dataset import CAMERA_ACTION_DIM, DOMAIN_NAME  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--checkpoint", required=True)
@@ -121,6 +122,12 @@ def make_prompt(goal_vec: np.ndarray, specified=None, crop=None) -> str:
         "conditioning_fps": torch.tensor(args.fps, dtype=torch.long),
         "image_size": torch.tensor([args.image_size, args.image_size]),
         "mode": "policy",
+        # `action` is here ONLY so the formatter can count total frames: `_get_total_frames`
+        # reads action.shape[0], and without it idle_frame reads "0." where training says
+        # "0 out of 8." — a 9-character divergence that string-level inspection missed and
+        # only a field-by-field diff against the dataset's own output surfaced. Zeros are
+        # correct: policy mode never conditions on the action, only on its length.
+        "action": torch.zeros(args.chunk_size, 1, dtype=torch.float32),
         "idle_frames": torch.tensor(0),
         "video": torch.zeros(3, args.chunk_size + 1, args.image_size, args.image_size,
                              dtype=torch.uint8),
@@ -135,10 +142,10 @@ def predict_chunk(model, frame_uint8: np.ndarray, prompt: str, seed: int) -> np.
     batch = build_action_batch(
         video=video,
         action=torch.zeros(args.chunk_size, 64, dtype=torch.float32),
-        raw_action_dim=9,
+        raw_action_dim=CAMERA_ACTION_DIM,
         prompt=prompt,
         view_point="ego_view",
-        domain_name="camera_pose",
+        domain_name=DOMAIN_NAME,
         model_mode=ModelMode.POLICY,
         action_chunk_size=args.chunk_size,
         fps=args.fps,
@@ -146,11 +153,18 @@ def predict_chunk(model, frame_uint8: np.ndarray, prompt: str, seed: int) -> np.
         batch_size=1,
         device="cuda",
     )
+    # build_action_batch re-formats whatever it is handed, and `prompt` is already the
+    # formatted JSON -> double-wrapped, a shape training never produced. See
+    # closed_loop_eval.predict_chunk for the measurement.
+    batch["ai_caption"] = [prompt] * len(batch["ai_caption"])
     with torch.no_grad():
         out = model.generate_samples_from_batch(
             batch, guidance=args.guidance, num_steps=args.num_steps, seed=[seed],
         )
-    return out["action"][0].float().cpu().numpy()[:, :9]
+    chunk = out["action"][0].float().cpu().numpy()[:, :CAMERA_ACTION_DIM]
+    assert chunk.shape[1] == CAMERA_ACTION_DIM, (
+        f"predicted chunk is {chunk.shape[1]} wide, expected {CAMERA_ACTION_DIM}")
+    return chunk
 
 
 def goal_vec_from_profile(gp) -> np.ndarray:
@@ -261,7 +275,7 @@ def main():
             frame = np.asarray(obs["image"].convert("RGB").resize((args.image_size, args.image_size)),
                                dtype=np.uint8)
             chunk = predict_chunk(model, frame, prompt, seed=args.seed + ci * 100 + k)
-            for step in chunk:
+            for step in chunk[:, :9]:      # env takes the 9 pose dims
                 obs, _ = env.step(step, render=False)
             obs = env.reset(env.position, env.forward, env.up)      # re-render the new view
             # keep every intermediate view: the trajectory is the interesting part, and a single

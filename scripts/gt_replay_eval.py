@@ -250,6 +250,12 @@ def make_prompt(goal_vec: np.ndarray, crop=None) -> str:
         "conditioning_fps": torch.tensor(args.fps, dtype=torch.long),
         "image_size": torch.tensor([args.image_size, args.image_size]),
         "mode": "policy",
+        # `action` is here ONLY so the formatter can count total frames: `_get_total_frames`
+        # reads action.shape[0], and without it idle_frame reads "0." where training says
+        # "0 out of 8." — a 9-character divergence that string-level inspection missed and
+        # only a field-by-field diff against the dataset's own output surfaced. Zeros are
+        # correct: policy mode never conditions on the action, only on its length.
+        "action": torch.zeros(args.chunk_size, 1, dtype=torch.float32),
         "idle_frames": torch.tensor(0),
         "video": torch.zeros(3, args.chunk_size + 1, args.image_size, args.image_size,
                              dtype=torch.uint8),
@@ -285,6 +291,10 @@ def predict_chunks(model, frame_uint8: np.ndarray, prompt: str, seed: int,
             action_chunk_size=args.chunk_size, fps=args.fps,
             input_video_key=model.config.input_video_key, batch_size=1, device="cuda",
         )
+        # build_action_batch re-formats whatever it is handed, and `prompt` is already the
+        # formatted JSON -> double-wrapped, a shape training never produced. See
+        # closed_loop_eval.predict_chunk for the measurement.
+        batch["ai_caption"] = [prompt] * len(batch["ai_caption"])
         with torch.no_grad():
             res = model.generate_samples_from_batch(
                 batch, guidance=args.guidance, num_steps=args.num_steps, seed=[seed + j],

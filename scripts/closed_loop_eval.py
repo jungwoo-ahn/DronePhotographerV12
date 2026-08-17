@@ -164,7 +164,7 @@ def load_policy():
     return pipe.model
 
 
-def make_prompt(goal_vec: np.ndarray, crop=None) -> str:
+def make_prompt(goal_vec: np.ndarray, crop=None, *, idle_frames: int | None = 0) -> str:
     """The goal as the JSON string the model was trained on.
 
     `crop` is not optional in practice: the exporter always passes it
@@ -175,6 +175,13 @@ def make_prompt(goal_vec: np.ndarray, crop=None) -> str:
     Training prompts carry `idle_frame`, and the stock inference path drops it, so
     pass mode/idle_frames explicitly — otherwise the prompt drifts from training in
     a way that is invisible until the numbers come out wrong.
+
+    `idle_frames` is a knob because that field LEAKS the shoot label. Measured over 6000
+    exported episodes: idle_frames > 0 => shoot=1 in 896/896 (100%), idle_frames == 0 =>
+    11.3%. It cannot be otherwise — post-arrival steps have translation exactly 0 and rot6d
+    exactly identity, so they are idle by construction. 0 is the training-modal value (81%);
+    `None` omits the field entirely, which is the ablation that separates "the policy learned
+    to declare arrival" from "the policy is reading the leak".
     """
     formatter = ActionPromptJsonFormatter()
     # __call__ takes the sample dict and REPLACES ai_caption with the JSON structure,
@@ -186,10 +193,17 @@ def make_prompt(goal_vec: np.ndarray, crop=None) -> str:
         "conditioning_fps": torch.tensor(args.fps, dtype=torch.long),
         "image_size": torch.tensor([args.image_size, args.image_size]),
         "mode": "policy",
-        "idle_frames": torch.tensor(0),
+        # `action` is here ONLY so the formatter can count total frames: `_get_total_frames`
+        # reads action.shape[0], and without it idle_frame reads "0." where training says
+        # "0 out of 8." — a 9-character divergence that string-level inspection missed and
+        # only a field-by-field diff against the dataset's own output surfaced. Zeros are
+        # correct: policy mode never conditions on the action, only on its length.
+        "action": torch.zeros(args.chunk_size, 1, dtype=torch.float32),
         "video": torch.zeros(3, args.chunk_size + 1, args.image_size, args.image_size,
                              dtype=torch.uint8),
     }
+    if idle_frames is not None:
+        sample["idle_frames"] = torch.tensor(int(idle_frames))
     out = formatter(sample)["ai_caption"]
     return out if isinstance(out, str) else json.dumps(out)
 
@@ -219,6 +233,13 @@ def predict_chunk(model, frame_uint8: np.ndarray, prompt: str, seed: int) -> np.
         batch_size=1,
         device="cuda",
     )
+    # `build_action_batch` runs `_format_prompt` on whatever it is handed, and `prompt` is
+    # ALREADY the formatted JSON from `make_prompt`. That formatted it a second time: the
+    # model saw an 868-char JSON whose actions[0].description was the entire escaped
+    # 573-char first JSON, a shape training never produced. Training formats exactly once
+    # (the dataset transform), so overwrite the field rather than let it be wrapped again.
+    batch["ai_caption"] = [prompt] * len(batch["ai_caption"])
+
     with torch.no_grad():
         out = model.generate_samples_from_batch(
             batch, guidance=args.guidance, num_steps=args.num_steps, seed=[seed],

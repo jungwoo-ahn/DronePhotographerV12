@@ -85,6 +85,7 @@ from cosmos_framework.scripts.action_policy_server_utils import (  # noqa: E402
 )
 
 from src.common.annotations import iter_goal_start_windows  # noqa: E402
+from src.data.cosmos_camera_dataset import CAMERA_ACTION_DIM, DOMAIN_NAME  # noqa: E402
 from src.common.blender_env import BlenderRolloutEnv, SubprocessBlenderRenderer  # noqa: E402
 from src.common.dataset_base import DEFAULT_EXCLUDE_OBJECTS, _window_object  # noqa: E402
 from src.common.facing import sector8  # noqa: E402
@@ -136,6 +137,9 @@ def make_prompt(goal_vec: np.ndarray) -> str:
         "conditioning_fps": torch.tensor(args.fps, dtype=torch.long),
         "image_size": torch.tensor([args.image_size, args.image_size]),
         "mode": "policy", "idle_frames": torch.tensor(0),
+        # length hint only: _get_total_frames reads action.shape[0], and without it
+        # idle_frame reads "0." where training says "0 out of 8."
+        "action": torch.zeros(args.chunk_size, 1, dtype=torch.float32),
         "video": torch.zeros(3, args.chunk_size + 1, args.image_size, args.image_size,
                              dtype=torch.uint8),
     }
@@ -155,14 +159,18 @@ def predict(model, frame, prompt, seed):
     for j in range(args.samples):
         batch = build_action_batch(
             video=video.clone(), action=torch.zeros(args.chunk_size, 64),
-            raw_action_dim=9, prompt=prompt, view_point="ego_view",
-            domain_name="camera_pose", model_mode=ModelMode.POLICY,
+            raw_action_dim=CAMERA_ACTION_DIM, prompt=prompt, view_point="ego_view",
+            domain_name=DOMAIN_NAME, model_mode=ModelMode.POLICY,
             action_chunk_size=args.chunk_size, fps=args.fps,
             input_video_key=model.config.input_video_key, batch_size=1, device="cuda")
+        # build_action_batch re-formats whatever it is handed, and `prompt` is already the
+        # formatted JSON -> double-wrapped, a shape training never produced. See
+        # closed_loop_eval.predict_chunk for the measurement.
+        b["ai_caption"] = [prompt] * len(b["ai_caption"])
         with torch.no_grad():
             r = model.generate_samples_from_batch(
                 batch, guidance=args.guidance, num_steps=args.num_steps, seed=[seed + j])
-        acc.append(r["action"][0].float().cpu().numpy()[:, :9])
+        acc.append(r["action"][0].float().cpu().numpy()[:, :CAMERA_ACTION_DIM])
     return np.stack(acc).mean(axis=0)
 
 
