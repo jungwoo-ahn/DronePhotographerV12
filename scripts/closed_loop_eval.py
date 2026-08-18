@@ -98,6 +98,11 @@ ap.add_argument("--val-scenes", default="configs/val_scenes.json",
                      "Pass '' to fall back to replaying the export enumeration, which is "
                      "how every pre-v5 number defined held-out (never-sampled placements, "
                      "whose SCENES the model had still trained on).")
+ap.add_argument("--samples", type=int, default=1,
+                help="draws per chunk, averaged before execution. 1 reproduces every earlier "
+                     "number. K>1 targets a measured weakness: the shoot probe fired on only "
+                     "62%% of windows that truly contained an arrival, and this policy's "
+                     "single-draw action error is known to be dominated by sampling variance.")
 ap.add_argument("--stop-on-shoot", type=int, default=1,
                 help="end the rollout at the first chunk whose predicted shoot channel "
                      "crosses --shoot-threshold. 0 keeps the fixed n_chunks length, which "
@@ -241,9 +246,18 @@ def predict_chunk(model, frame_uint8: np.ndarray, prompt: str, seed: int) -> np.
     batch["ai_caption"] = [prompt] * len(batch["ai_caption"])
 
     with torch.no_grad():
-        out = model.generate_samples_from_batch(
-            batch, guidance=args.guidance, num_steps=args.num_steps, seed=[seed],
-        )
+        draws = []
+        for k in range(max(1, args.samples)):
+            r = model.generate_samples_from_batch(
+                batch, guidance=args.guidance, num_steps=args.num_steps,
+                seed=[seed + 100_000 * k],
+            )
+            draws.append(r["action"][0].float().cpu().numpy())
+    # Mean of K. Averaging the SHOOT dim too is deliberate: its output is effectively binary
+    # (measured on 300 held-out windows: 90.5% below 0.05, 9.5% above 0.95, 0.1% between), so
+    # the mean is the FRACTION OF DRAWS that voted to stop and thresholding it at 0.5 is a
+    # majority vote, not a blurred number.
+    out = {"action": [draws[0] if len(draws) == 1 else np.mean(draws, axis=0)]}
     # Slice to the FULL action width, not 9. Truncating here dropped the shoot channel
     # before the caller ever saw it, and the caller's `if chunk.shape[1] > 9` guard then
     # quietly read 0.0 forever -- termination would simply never fire, with nothing in the

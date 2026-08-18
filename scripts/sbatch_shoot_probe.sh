@@ -40,4 +40,26 @@ export IMAGINAIRE_OUTPUT_ROOT="${IMAGINAIRE_OUTPUT_ROOT:-$V12/runs/train}"
 export BASE_CHECKPOINT_PATH="${BASE_CHECKPOINT_PATH:-$CF/examples/checkpoints/Cosmos3-Nano}"
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 
-exec "$CF/.venv/bin/python" scripts/shoot_probe.py "$@"
+# Self-requeue on preemption. `share` is evicted the moment another account wants the GPU,
+# and without this the job simply dies: the last attempt was preempted at 13 min and nothing
+# resubmitted it, so the probe sat unfinished for a day. Safe because --resume skips windows
+# already in the output file.
+#   - `exec` would replace this shell and destroy the trap  -> run python in background
+#   - a FOREGROUND child defers the handler until it exits  -> `&` + `wait`
+#   - `scancel` raises the same SIGTERM as a preemption      -> check sacct State first
+_args=("$@")
+_handle_term() {
+    state=$(sacct -j "$SLURM_JOB_ID" -X -n -P -o State 2>/dev/null | head -1)
+    case "$state" in
+        PREEMPTED*|*CANCELLED*by\ 0*)
+            echo "[requeue] preempted (state=$state) — resubmitting to finish the rest" >&2
+            sbatch -A share --qos=share "$0" "${_args[@]}" >&2
+            ;;
+        *) echo "[requeue] state=$state — not a preemption, exiting" >&2 ;;
+    esac
+    exit 143
+}
+trap _handle_term SIGTERM
+
+"$CF/.venv/bin/python" scripts/shoot_probe.py "$@" &
+wait $!

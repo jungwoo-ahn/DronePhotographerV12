@@ -67,6 +67,11 @@ ap.add_argument("--val-scenes", default=f"{V12}/configs/val_scenes.json")
 ap.add_argument("--out", default=f"{V12}/runs/eval/shoot_probe.json")
 ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--no-ema", action="store_true")
+ap.add_argument("--resume", type=int, default=1,
+                help="continue from a partial --out instead of redoing finished windows. "
+                     "Needed on `share`, which is evicted the moment another account wants "
+                     "the GPU; without it every eviction restarts from window 0 and a job "
+                     "that takes longer than the gap between evictions never finishes.")
 args = ap.parse_args()
 
 from cosmos_framework.inference.common.init import init_script  # noqa: E402
@@ -252,7 +257,20 @@ def main() -> int:
 
     # ---- 1/2: distribution + PR, at the training-modal idle_frame=0 ----------------
     rows = []
+    done_keys: set = set()
+    if args.resume and OUT.exists():
+        try:
+            prev = json.loads(OUT.read_text())
+            rows = prev.get("rows", [])
+            done_keys = {r["placement"] for r in rows}
+            print(f"[probe] resuming: {len(rows)} windows already done", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[probe] could not resume ({exc}); starting over", flush=True)
+            rows = []
+
     for i, e in enumerate(eps):
+        if e["placement"] in done_keys:
+            continue
         img = np.asarray(Image.open(e["start_image"]).convert("RGB"))
         p = make_prompt(np.array(e["goal_vec"]), crop=e["goal_raw"], idle_frames=0)
         pred = np.stack([predict(model, img, p, seed=args.seed + 1000 * k + i)
@@ -263,11 +281,22 @@ def main() -> int:
                      "pred_trans_absmax": float(np.abs(pred[:, :, :3]).max())})
         if (i + 1) % 25 == 0:
             print(f"  [dist] {i+1}/{len(eps)}", flush=True)
-            OUT.write_text(json.dumps({"partial": True, "rows": rows}, indent=1))
+            OUT.write_text(json.dumps({"partial": True, "rows": rows, "sweep": []}, indent=1))
 
     # ---- 3: the leak sweep, same window and seed, only idle_frame changes ----------
     sweep = []
+    if args.resume and OUT.exists():
+        try:
+            sweep = json.loads(OUT.read_text()).get("sweep", []) or []
+            if sweep:
+                print(f"[probe] resuming sweep: {len(sweep)} done", flush=True)
+        except Exception:  # noqa: BLE001
+            sweep = []
+    swept = {r["placement"] for r in sweep}
+
     for i, e in enumerate(eps[: args.n_sweep]):
+        if e["placement"] in swept:
+            continue
         img = np.asarray(Image.open(e["start_image"]).convert("RGB"))
         rec = {k: e[k] for k in ("placement", "scene", "sector", "delta", "arrival",
                                  "true_shoot")}
@@ -278,6 +307,7 @@ def main() -> int:
         sweep.append(rec)
         if (i + 1) % 25 == 0:
             print(f"  [sweep] {i+1}/{min(args.n_sweep, len(eps))}", flush=True)
+            OUT.write_text(json.dumps({"partial": True, "rows": rows, "sweep": sweep}, indent=1))
 
     OUT.write_text(json.dumps({
         "checkpoint": args.checkpoint,
