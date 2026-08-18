@@ -143,3 +143,22 @@ def test_relative_manifest_resolves_against_the_repo_not_the_cwd(tmp_path, monke
     rel = Path("configs/val_scenes.json")
     resolved = rel if rel.is_absolute() else m.V12_ROOT / rel
     assert resolved.exists(), resolved
+
+
+def test_no_script_defaults_the_manifest_to_a_relative_path():
+    """Third occurrence of one bug, so pin it.
+
+    Scripts that talk to Cosmos do `os.chdir(CF_ROOT)` because the framework resolves model
+    configs by relative path. A relative "configs/val_scenes.json" default is therefore looked
+    for inside the vendored checkout. It killed a training run, was fixed in the dataset
+    module, then came back as a NEW --val-scenes flag and killed all three rollouts at once.
+    """
+    import re
+    bad = []
+    for path in Path("scripts").glob("*.py"):
+        for m in re.finditer(r'"--val-scenes",\s*default=([^,)\n]+)', path.read_text()):
+            expr = m.group(1).strip()
+            if expr.startswith('"') or expr.startswith("'"):
+                bad.append(f"{path.name}: default={expr}")
+    assert not bad, ("--val-scenes must default to the absolute DEFAULT_VAL_SCENES constant, "
+                     f"not a string literal: {bad}")

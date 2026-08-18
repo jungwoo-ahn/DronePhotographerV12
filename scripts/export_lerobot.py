@@ -30,6 +30,7 @@ from src.common.dataset_base import (
     shoot_column,
 )
 from src.common.facing import sector8
+from src.data.cosmos_camera_dataset import DEFAULT_VAL_SCENES
 
 SECTOR_ORDER = (
     "front", "front-right", "right", "back-right",
@@ -56,7 +57,7 @@ ap.add_argument("--episodes-per-video", type=int, default=20000,
                 help="episodes per mp4. One file for everything makes each episode's "
                      "from_timestamp seek scale with total size — a 150k single-file "
                      "export halved training throughput.")
-ap.add_argument("--val-scenes", default="configs/val_scenes.json",
+ap.add_argument("--val-scenes", default=DEFAULT_VAL_SCENES,
                 help="manifest of scenes held out as val. Placements are partitioned by scene "
                      "BEFORE the fill and each side is balanced separately — filtering a "
                      "globally-balanced draw afterwards would re-skew both sides by whatever "

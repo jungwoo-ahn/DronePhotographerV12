@@ -54,6 +54,12 @@ os.chdir(CF_ROOT)
 
 import numpy as np
 
+# Imported ahead of argparse so `--val-scenes` can default to it. It is ABSOLUTE: this
+# script does `os.chdir(CF_ROOT)` (Cosmos resolves model configs by relative path), so a
+# relative default is looked for inside the vendored checkout. That already killed a
+# training run once; re-introducing it here as a new flag killed all three rollouts.
+from src.data.cosmos_camera_dataset import DEFAULT_VAL_SCENES  # noqa: E402
+
 ap = argparse.ArgumentParser()
 ap.add_argument("--checkpoint", required=True)
 ap.add_argument("--episodes", type=int, default=24)
@@ -93,7 +99,7 @@ ap.add_argument("--out", default=f"{V12}/runs/closed_loop/eval.json")
 ap.add_argument("--resume", type=int, default=1,
                 help="continue from <out>.partial.json instead of redoing "
                      "episodes a preempted run already finished")
-ap.add_argument("--val-scenes", default="configs/val_scenes.json",
+ap.add_argument("--val-scenes", default=DEFAULT_VAL_SCENES,
                 help="scene manifest defining the holdout, matching the training split. "
                      "Pass '' to fall back to replaying the export enumeration, which is "
                      "how every pre-v5 number defined held-out (never-sampled placements, "
