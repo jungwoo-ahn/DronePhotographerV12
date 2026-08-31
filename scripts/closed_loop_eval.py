@@ -263,12 +263,19 @@ def predict_chunk(model, frame_uint8: np.ndarray, prompt: str, seed: int) -> np.
     # (measured on 300 held-out windows: 90.5% below 0.05, 9.5% above 0.95, 0.1% between), so
     # the mean is the FRACTION OF DRAWS that voted to stop and thresholding it at 0.5 is a
     # majority vote, not a blurred number.
-    out = {"action": [draws[0] if len(draws) == 1 else np.mean(draws, axis=0)]}
+    # `draws` are already numpy (`.float().cpu().numpy()` above), so the old
+    # `out["action"][0].float()...` tail cannot apply to them -- that mismatch made EVERY
+    # episode raise AttributeError and be recorded as FAILED, while the run itself kept
+    # going and looked like a preemption problem.
+    chunk = (draws[0] if len(draws) == 1 else np.mean(draws, axis=0))
     # Slice to the FULL action width, not 9. Truncating here dropped the shoot channel
     # before the caller ever saw it, and the caller's `if chunk.shape[1] > 9` guard then
     # quietly read 0.0 forever -- termination would simply never fire, with nothing in the
     # log to say why. Same silent-fallback shape as the diagnostics collector bug.
-    return out["action"][0].float().cpu().numpy()[:, :CAMERA_ACTION_DIM]
+    chunk = chunk[:, :CAMERA_ACTION_DIM]
+    assert chunk.shape[1] == CAMERA_ACTION_DIM, (
+        f"predicted chunk is {chunk.shape[1]} wide, expected {CAMERA_ACTION_DIM}")
+    return chunk
 
 
 def geometry_distance(position, forward, up, goal_view, intr) -> float:
@@ -486,6 +493,7 @@ def main() -> int:
     frames_dir = Path(args.out).parent / f"frames_{Path(args.out).stem}"
     frames_dir.mkdir(parents=True, exist_ok=True)
 
+    _failed = 0
     for i, (name, path, window, goal_vec, bearing, sec) in enumerate(episodes):
         if (name, window.start.image, window.goal_frame.image) in done_keys:
             continue
@@ -580,6 +588,15 @@ def main() -> int:
             _tmp.replace(_partial)
         except Exception as exc:  # noqa: BLE001
             print(f"[eval] {i+1} FAILED {name[:40]}: {type(exc).__name__}: {exc}", flush=True)
+            _failed += 1
+            # Abort instead of grinding through 160 identical failures. A per-episode
+            # try/except is right for a bad placement, but it also swallowed a code bug that
+            # broke EVERY episode: the run kept going, finished, and looked like a
+            # preemption problem rather than an AttributeError on the first prediction.
+            if _failed >= 5 and not results:
+                print(f"[eval] ABORT — first {_failed} episodes all failed and none "
+                      f"succeeded; this is a code fault, not bad data", flush=True)
+                raise SystemExit(1)
 
     if not results:
         print("[eval] every episode failed", flush=True)
