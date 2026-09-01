@@ -123,7 +123,66 @@ cosmos venv (`test_prompt_single_format`, `test_shoot_and_scene_split`,
 `test_diagnostics_action_width`, plus the serializer contract): the move of `goal_prompt` did
 not change a byte on the training side.
 
-## 5. Not done here
+## 5. Rendered: does an authored goal look like the shot that was asked for?
+
+A goal names a shot, so it can be checked without the policy. `src/goal_authoring/pose_solver.py`
+inverts the stage-3 scorer — the same `compute_v5_scores` over the subject's projected mesh that
+produced every training goal — to the camera pose that realises a goal in a given placement, and
+Blender renders that pose. `scripts/render_authored_goals.py` runs it end to end (geometry dump →
+author → solve → render → re-read with Module 2); `scripts/build_goal_render_report.py` builds the
+gallery.
+
+**The forward model is exact, not a proxy.** `score_pose` needs the subject's world mesh vertices
+and the camera frame bounds, which only Blender has; `scripts/dump_placement_geometry.py` extracts
+them once per placement (≈8 s). Measured against a placement's own 384 recorded frames, the
+projected bbox lands within **0.7 px MAE (max 4.7)** of the stored `bbox_xyxy_full`, and every
+score key within 0.36. A fitted elliptic-cylinder proxy — the alternative — was ~20 px.
+
+**The inversion is well posed, with one honest exception.** Bearing and elevation are closed-form;
+distance and the two aim offsets are least-squares. On synthetic geometry a goal built from a pose
+solves back to that pose. A goal cut at BOTH ends does not pin the camera: every tilt that keeps
+the box overflowing gives the identical visible box, so `solve()` reports `pose_underdetermined`
+rather than pretending. Occupancy enters the objective only when the goal is vertically cut, where
+`size` and `aim_y` stop carrying the subject's extent.
+
+**A goal is scene-agnostic; a scene is not goal-agnostic.** The first sweep solved each goal in a
+rotation of target placements and rendered whatever came out: in a basement, the requested sight
+line ran through a wall and the "shot" is a photograph of brickwork. The sampler's own cameras all
+passed its `is_camera_valid` ray-casts, so the driver now solves each goal in every candidate
+placement and shoots it where the required camera is closest to one the sampler used — choosing a
+location for a fixed shot, which is what a photographer does. Median distance from the solved
+camera to a validated one fell **1.37 m → 0.63 m, max 6.37 → 1.81 m**.
+
+**What the frames show** (14 requests and 8 reference frames, solved in 6 held-out placements,
+88 rendered poses — the gallery is `runs/goal_render_report.html`):
+
+| | bearing | elevation | placement x/y | shot size | crop side |
+|---|---|---|---|---|---|
+| achieved vs asked, NL (bank / rules), n=28 each | 28/28 · 28/28 | 28/28 · 28/28 | 28/28 · 28/28 | 25/28 · 21/28 | 18/28 · 19/28 |
+| achieved vs asked, reference transfer, n=16 each | 16/16 · 16/16 | 16/16 · 16/16 | 16/16 · 16/16 | 14/16 · 14/16 | 11/16 · 11/16 |
+| Module 2 read back vs achieved (NL, n=39) | 74 % | 51 % | 92 / 100 % | 77 % | 85 % |
+| Module 2 read back vs achieved (transfer, n=30) | 79 % | 67 % | 100 / 100 % | 87 % | 100 % |
+
+Read: the geometry the goal asks for is delivered **exactly** on every axis the camera alone
+controls — bearing, elevation and both placement axes are 88/88. Shot size misses when the
+requested occupancy is not reachable on that subject at that framing (bank 39/44, rules 35/44).
+**Crop side is the axis that does not transfer**: 58/88. It is a property of the subject's own
+proportions against the frame, so the same occupancy and centre on a taller or seated body cuts
+at a different place — which is also why `bench_completion` found it the hardest key to guess.
+The read-back rows are Module 2's error, not the render's; they track the held-out detector
+numbers of §4, and 19 of 88 renders have no detectable person at all — 13 of those are the
+snowman placement (YOLO reports a body, with torso keypoints, on a snowman).
+
+**The dataset's own goal frames are not all photographs of their subject.** The stage-3 profile
+comes from projecting the mesh, which ignores occlusion — so a frame can carry an ordinary shot
+profile while showing a wall or a reed bed. Measured on 80 sampled held-out goal frames, **30 %
+have no detectable person** (small subjects, non-human assets, and occluded ones), matching the
+70 % detection rate of §4 independently. `subject_really_visible` (detector box vs projected box,
+plus torso keypoints) screens targets and references on this; it catches the empty ones, and does
+not catch partial occlusion — one accepted reference is a subject standing behind reeds, whose
+composition transfers faithfully while the picture does not.
+
+## 6. Not done here
 
 * **Probe the policy's response** to authored prompts (teacher-forced, no Blender; the
   `shoot_probe.py` template): GT prompt vs bank-completed vs rule-completed on the same
@@ -135,3 +194,8 @@ not change a byte on the training side.
 * Resync `scripts/recon_from_reference.py` with the v5 rollout (shoot-stop, K samples) and
   run the recon on v5 with goals from `scripts/author_goal.py --json`.
 * `scripts/viz_goal_profile.py` still carries its own copy of the person-box solver.
+* The pose solver has no occlusion test of its own — proximity to a sampler-validated camera is a
+  proxy. A Blender ray-cast (what v7's `is_camera_valid` does) would settle it.
+* One scene reproducibly segfaults the persistent Blender render server ("could not get a list of
+  mounted file-systems", rc=-11) while loading fine for the geometry dump; the driver falls back to
+  one process per frame for such a scene rather than dropping it.
