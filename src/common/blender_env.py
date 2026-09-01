@@ -103,9 +103,17 @@ class SubprocessBlenderRenderer(Renderer):
                 self.blender_bin, "-b", "-P", self.render_script, "--",
                 "--run_info_path", str(run_info_path),
                 "--output_image", str(out_img), "--output_json", str(out_json),
-                "--position", *map(str, np.asarray(position).tolist()),
-                "--forward", *map(str, np.asarray(forward).tolist()),
-                "--up", *map(str, np.asarray(up).tolist()),
+                # Fixed-point, never `str(float)`. Blender ships Python 3.11, whose
+                # argparse decides whether a leading-dash token is a negative NUMBER with
+                # `^-\d+$|^-\d*\.\d+$` -- which scientific notation fails. So a component
+                # like -2.8e-05 is read as an option name and `--up` sees one value:
+                # "argument --up: expected 3 arguments". It killed a rollout at episode 2,
+                # and it is luck that our own scenes had not produced a small enough
+                # component yet. (Python 3.13 fixed the matcher, so this reproduces only
+                # inside Blender -- every attempt to reproduce it in the venv passed.)
+                "--position", *(f"{v:.9f}" for v in np.asarray(position).tolist()),
+                "--forward", *(f"{v:.9f}" for v in np.asarray(forward).tolist()),
+                "--up", *(f"{v:.9f}" for v in np.asarray(up).tolist()),
             ]
             proc = subprocess.run(cmd, cwd=str(self.repo_root), capture_output=True,
                                   text=True, timeout=self.timeout_s)
