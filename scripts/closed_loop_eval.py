@@ -99,6 +99,12 @@ ap.add_argument("--out", default=f"{V12}/runs/closed_loop/eval.json")
 ap.add_argument("--resume", type=int, default=1,
                 help="continue from <out>.partial.json instead of redoing "
                      "episodes a preempted run already finished")
+ap.add_argument("--split", default="val", choices=("val", "train", "all"),
+                help="which scenes to draw episodes from. `val` = the held-out manifest "
+                     "(the generalization number). `train` = scenes the model DID train on, "
+                     "which is the control the rollouts never had: without it a weak result "
+                     "cannot be attributed to the room being new rather than to the policy. "
+                     "`all` reproduces the old --held-out-only 0 behaviour.")
 ap.add_argument("--val-scenes", default=DEFAULT_VAL_SCENES,
                 help="scene manifest defining the holdout, matching the training split. "
                      "Pass '' to fall back to replaying the export enumeration, which is "
@@ -382,7 +388,15 @@ def pick_episodes() -> list:
     wanted = {x.strip() for x in args.sector.split(",") if x.strip()}
     dirs = sorted(d for d in os.listdir(args.root) if os.path.isdir(os.path.join(args.root, d)))
     trained: set[str] = set()
-    if args.held_out_only:
+    if args.split in ("val", "train") and args.val_scenes:
+        vs = frozenset(json.loads(Path(args.val_scenes).read_text())["scenes"])
+        want_val = args.split == "val"
+        keep = [d for d in dirs if (d.split("__")[0] in vs) == want_val]
+        trained = set(dirs) - set(keep)
+        dirs = keep
+        print(f"[eval] split={args.split}: {len(dirs)} placements "
+              f"({'held out of' if want_val else 'used in'} training)", flush=True)
+    elif args.held_out_only:
         if args.val_scenes:
             # A placement is held out iff its SCENE is in the val manifest -- the same
             # definition the training split uses, so "held-out" means one thing in this
@@ -582,7 +596,7 @@ def main() -> int:
             _tmp = _partial.with_suffix(".tmp")
             _tmp.write_text(json.dumps(
                 {"summary": {"checkpoint": args.checkpoint, "episodes": len(results),
-                             "held_out_only": bool(args.held_out_only),
+                             "held_out_only": bool(args.held_out_only), "split": args.split,
                              "frames_dir": str(frames_dir), "partial": True},
                  "episodes": results}, indent=1))
             _tmp.replace(_partial)
@@ -618,7 +632,7 @@ def main() -> int:
         "frac_positive": float((imp > 0).mean()),
         "mean_d_start": float(np.mean([r["d_start"] for r in results])),
         "mean_d_end": float(np.mean([r["d_end"] for r in results])),
-        "held_out_only": bool(args.held_out_only),
+        "held_out_only": bool(args.held_out_only), "split": args.split,
         "frames_dir": str(frames_dir),
         "guidance": args.guidance, "num_steps": args.num_steps,
         "chunks": args.chunks, "ema": not args.no_ema,
