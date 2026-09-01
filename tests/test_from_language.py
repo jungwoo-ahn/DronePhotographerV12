@@ -28,7 +28,7 @@ def test_language_to_goal_partial_and_grounded():
     gp = language_to_goal("just a close-up", keyword_classifier)
     assert gp.specified == frozenset({"occupancy"})   # nothing else stated
     assert gp.categories() == {"shot_size": "close-up"}
-    assert "close-up" in gp.to_nl()
+    assert "close-up" in gp.to_prompt()
 
 
 def test_validate_drops_invalid_labels():
@@ -45,12 +45,31 @@ def test_mock_classifier_flows_through_grounding():
     assert gp.values[SUBJECT_BEARING_KEY] == 45.0     # front-right centroid
 
 
-def test_serializer_roundtrip_through_keyword_classifier():
-    # profile -> NL (serializer) -> keyword classifier -> categories should recover the goal
+def test_training_prompt_roundtrips_through_keyword_classifier():
+    # profile -> TRAINING prompt -> keyword classifier -> categories should recover the goal.
+    # This used to run through a second serializer that the parser had been written against.
     original = GoalProfile.from_categories({
         "shot_size": "close-up", "bearing": "front-right", "elevation": "high angle",
         "placement_x": "right third", "placement_y": "upper", "body_framing": "full body in frame",
+        "crop_side": "cropped at the legs",
     })
-    nl = original.to_nl(numbers=True)
+    nl = original.to_prompt()
     recovered = language_to_goal(nl, keyword_classifier, project_feasible=False)
     assert recovered.categories() == original.categories()
+
+
+def test_keyword_classifier_reads_a_real_training_prompt():
+    tp = ("Move the camera to achieve this shot: a medium-wide shot of the subject from the subject's "
+          "front-left, at eye level, left third and mid in the frame, mostly in frame, cropped above "
+          "the head. (bearing 297°, occupancy 24%, elevation -5°, body_in_frame 68%, center 142/332 px, "
+          "half_size 142/332 px, visible 0.71)")
+    assert keyword_classifier(tp) == {
+        "shot_size": "medium-wide shot", "elevation": "eye level", "bearing": "front-left",
+        "placement_x": "left third", "placement_y": "mid", "body_framing": "mostly in frame",
+        "crop_side": "cropped above the head"}
+
+
+def test_gold_set_phrasings_that_used_to_miss():
+    assert keyword_classifier("straight-on portrait, they're looking right at us")["bearing"] == "front"
+    assert keyword_classifier("medium close-up, right profile")["bearing"] == "right"
+    assert keyword_classifier("cut them off at the head and the feet")["crop_side"] == "cropped at both the head and the feet"

@@ -7,12 +7,19 @@ subject bearing via a fitted regressor (~85-91% front/side/back, MAE ~18deg) and
 a second regressor (MAE ~8deg vs 13.7 for predict-median). Both beat a VLM by a wide margin — the VLM
 was at chance on elevation and 68%/32% on bearing.
 
+What a photograph cannot show is the part of the subject OUTSIDE the frame, and the training prompt
+carries exactly that: `body_in_frame`, `visible`, and a crop word that distinguishes "cut at the
+legs" from "cut below the waist". Leaving those out is not neutral — no training prompt lacks them
+— so this module estimates the out-of-frame extent from the body's OWN proportions
+(`estimate_vertical_extent`: standard segment heights, Drillis & Contini) when enough joints are
+visible, and otherwise reports the cut SIDE only and lets `completion` fill the rest.
+
 Caveat on elevation: the v7 data is 68% high-angle / 3.5% low-angle, so low-angle references are
 extrapolation; treat the estimate as a prior the user can override in words.
 """
 from __future__ import annotations
 
-import os
+from pathlib import Path
 
 import numpy as np
 
@@ -21,9 +28,12 @@ from src.goal_authoring.goal_profile import GoalProfile
 from src.goal_authoring.pose_bearing import BearingModel, ElevationModel, elev_features, pose_features
 from src.scoring.bbox_control import compute_v5_scores
 
-DEFAULT_POSE_MODEL = "yolo11l-pose.pt"
-DEFAULT_BEARING_MODEL = "assets/models/bearing_pose_rf.joblib"
-DEFAULT_ELEVATION_MODEL = "assets/models/elevation_pose_rf.joblib"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+# Anchored to the repo: the estimator used to resolve these against the cwd, so it only worked
+# from scripts that chdir into the repo first.
+DEFAULT_POSE_MODEL = str(REPO_ROOT / "yolo11l-pose.pt")
+DEFAULT_BEARING_MODEL = str(REPO_ROOT / "assets" / "models" / "bearing_pose_rf.joblib")
+DEFAULT_ELEVATION_MODEL = str(REPO_ROOT / "assets" / "models" / "elevation_pose_rf.joblib")
 
 # keys the detected 2D bbox pins exactly (same computation as the training profile)
 GEOM_KEYS = ("occupancy", "object_center_x", "object_center_y", "bbox_x_offset", "bbox_y_offset")
@@ -56,10 +66,10 @@ def crop_from_bbox(bbox, image_h: int, *, margin_frac: float = 0.002, kp=None) -
     knows both the side and the fraction. A detector's box on a real photograph is already
     clipped to the image: the subject's true extent beyond the edge is simply not observable.
 
-    So this returns the side (`top_cut_frac` / `bot_cut_frac` as booleans-in-float form) and
-    reports `visible_frac` ONLY when nothing is cut, where it is exactly 1.0. Inventing a
-    fraction for a cut box would put a fabricated number straight into the prompt — and the
-    prompt is the only channel the policy has.
+    So this returns the side (`top_cut_frac` / `bot_cut_frac` as booleans-in-float form, 1.0
+    meaning "cut, fraction unknown") and reports `visible_frac` ONLY when nothing is cut, where
+    it is exactly 1.0. `estimate_vertical_extent` is the step that turns the side into a
+    fraction when the body's own proportions allow it.
 
     Replaces the old `estimate_body_in_frame`, which detected `top_cut`/`bot_cut` internally and
     then threw the side away into one of three magic area numbers (100/55/60) — the exact
@@ -102,32 +112,117 @@ def crop_from_bbox(bbox, image_h: int, *, margin_frac: float = 0.002, kp=None) -
     return out
 
 
+# --------------------------------------------------------------------------- #
+# out-of-frame extent from body proportions
+# --------------------------------------------------------------------------- #
+# Height of each COCO joint level above the ground, as a fraction of stature (Drillis &
+# Contini 1966 segment proportions; eyes/ears sit ~0.936, the vertex is 1.0). A standing
+# body is close to a vertical line in the image, so these are collinear in image y up to
+# perspective, and a line fitted through the VISIBLE joints extrapolates to the vertex and
+# the soles — the part of the subject the frame cut off.
+ANTHRO_LEVELS: dict[str, tuple[tuple[int, ...], float]] = {
+    "head": ((0, 1, 2, 3, 4), 0.936),
+    "shoulder": ((5, 6), 0.818),
+    "hip": ((11, 12), 0.530),
+    "knee": ((13, 14), 0.285),
+    "ankle": ((15, 16), 0.039),
+}
+EXTENT_MIN_R2 = 0.97          # the fit must look like one upright body
+
+
+def estimate_vertical_extent(kp, image_h: int, *, conf_min: float = 0.5,
+                             min_levels: int = 3) -> dict[str, float] | None:
+    """Where the subject's vertex and soles are in image y, from the joints that ARE visible.
+
+    Fits y = y_ground - stature_px * level over the confident, in-frame joint levels (at
+    least `min_levels`, so a single segment cannot set the scale). Returns None when the fit
+    is not available or not upright (a seated or lying subject breaks the proportions, and
+    so does a foreshortened one; `r2` lets the caller gate on it).
+    """
+    kp = np.asarray(kp, dtype=np.float64)
+    if kp.ndim != 2 or kp.shape[0] < 17:
+        return None
+    ys, fs = [], []
+    for joints, frac in ANTHRO_LEVELS.values():
+        pts = [kp[j] for j in joints if float(kp[j][2]) >= conf_min and 0.0 < float(kp[j][1]) < image_h]
+        if pts:
+            ys.append(float(np.mean([p[1] for p in pts])))
+            fs.append(frac)
+    if len(ys) < min_levels:
+        return None
+    b, a = np.polyfit(fs, ys, 1)
+    if b >= 0.0:
+        return None                                  # higher joints must sit higher in the image
+    pred = a + b * np.asarray(fs)
+    ss_res = float(np.sum((np.asarray(ys) - pred) ** 2))
+    ss_tot = float(np.sum((np.asarray(ys) - np.mean(ys)) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0
+    return {"y_top": float(a + b), "y_bottom": float(a), "stature_px": float(-b),
+            "r2": float(r2), "n_levels": float(len(ys))}
+
+
+def crop_fractions_from_extent(crop: dict[str, float], extent: dict[str, float] | None,
+                               image_h: int, *, min_r2: float = EXTENT_MIN_R2) -> dict[str, float] | None:
+    """Turn a cut SIDE (from `crop_from_bbox`) into cut FRACTIONS using the body extent.
+
+    The box edge still decides WHETHER a side is cut (its measured accuracy is the reason);
+    the extent only says HOW MUCH. A cut side gets at least 0.021 so the word stays "cut".
+    Returns None when the extent is missing or not trustworthy, leaving the side-only form.
+    """
+    if extent is None or extent["r2"] < min_r2 or not crop:
+        return None
+    span = extent["y_bottom"] - extent["y_top"]
+    if span <= 1.0:
+        return None
+    t_est = max(0.0, -extent["y_top"]) / span
+    b_est = max(0.0, extent["y_bottom"] - image_h) / span
+    t = max(t_est, 0.021) if crop.get("top_cut_frac", 0.0) > 0 else 0.0
+    b = max(b_est, 0.021) if crop.get("bot_cut_frac", 0.0) > 0 else 0.0
+    if t + b > 0.9:
+        return None
+    return {"head_in_frame": 0.0 if t > 0 else 1.0, "top_cut_frac": t, "bot_cut_frac": b,
+            "visible_frac": 1.0 - t - b}
+
+
 def profile_from_detection(bbox, kp, image_w: int, image_h: int, bearing: BearingModel | None,
                            elevation: "ElevationModel | None" = None,
-                           *, bearing_conf_min: float = 0.35) -> GoalProfile:
+                           *, bearing_conf_min: float = 0.35,
+                           extent_min_r2: float = EXTENT_MIN_R2) -> GoalProfile:
     """Assemble a GoalProfile from one detection. `bearing`/`elevation` may be None (then unspecified).
 
     Elevation comes from pose keypoints, NOT a VLM (which was at chance): vertical foreshortening
     carries camera pitch, CV MAE ~8deg. Caveat: the v7 data it was fitted on is 68% high-angle /
-    3.5% low-angle, so low-angle references are extrapolation."""
+    3.5% low-angle, so low-angle references are extrapolation.
+
+    Everything measured is marked `exact`; the crop fractions are exact only when they came
+    from the body-extent fit. `body_in_frame_ratio` is never asserted here — it follows from the
+    fractions in `completion` (it equals the visible fraction when the box is not x-clipped).
+    """
     vals = geometric_keys(bbox, image_w, image_h)
     spec = set(GEOM_KEYS)
+    exact = set(GEOM_KEYS)
     if bearing is not None and kp is not None:
         bdeg, conf = bearing.bearing_deg(pose_features(kp, bbox))
         if conf >= bearing_conf_min:
             vals[SUBJECT_BEARING_KEY] = bdeg
             spec.add(SUBJECT_BEARING_KEY)
+            exact.add(SUBJECT_BEARING_KEY)
     if elevation is not None and kp is not None:
         vals["cam_to_obj_elevation_deg"] = elevation.elevation_deg(
             elev_features(kp, bbox, image_w, image_h))
         spec.add("cam_to_obj_elevation_deg")
-    # Crop side, not an area ratio. `body_in_frame_ratio` is left UNSPECIFIED on purpose: it is
-    # an area fraction of the subject's full extent, and that extent is unobservable in a
-    # clipped photograph. `goal_prompt(specified=...)` drops the clause rather than guess.
+        exact.add("cam_to_obj_elevation_deg")
     crop = crop_from_bbox(bbox, image_h, kp=kp)
+    extent = estimate_vertical_extent(kp, image_h) if kp is not None else None
+    sized = crop_fractions_from_extent(crop, extent, image_h, min_r2=extent_min_r2)
+    if sized is not None:
+        crop = sized
+        exact.update(k for k in ("top_cut_frac", "bot_cut_frac", "visible_frac") if k in crop)
+    elif crop.get("visible_frac") == 1.0:
+        exact.update(("top_cut_frac", "bot_cut_frac", "visible_frac"))   # nothing cut: exact by definition
     vals.update(crop)
     spec.update(crop)
-    return GoalProfile(vals, frozenset(spec))
+    return GoalProfile(vals, frozenset(spec), frozenset(exact))
 
 
 class ReferenceEstimator:
@@ -149,7 +244,7 @@ class ReferenceEstimator:
         self.device = device
         self.bearing = BearingModel.load(bearing_model)
         self.elevation = (ElevationModel.load(elevation_model)
-                          if elevation_model and os.path.exists(elevation_model) else None)
+                          if elevation_model and Path(elevation_model).exists() else None)
 
     def detect_main_subject(self, image):
         """Return (bbox, keypoints, W, H) for the most prominent person, or None."""

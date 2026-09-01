@@ -1,16 +1,16 @@
-"""Demo/validate Module 1: NL -> GoalProfile. Shows the keyword baseline and (with --llm) the real
-LLM classifier on varied requests, printing categories, grounded profile, and the re-serialized prompt."""
+"""Demo Module 1 end to end: NL -> partial profile -> COMPLETE goal -> the training-shape prompt.
+
+Shows, per request, what the classifier parsed, then the bank-completed and rule-completed goals
+side by side with per-key provenance. `--llm MODEL` switches to the hybrid classifier (keyword
+rules first, LLM fills what they miss; needs an env with transformers).
+"""
 import argparse, os, sys
 sys.path.insert(0, "/home/nas_main/jungwooahn/projects/DronePhotographerV12")
 os.chdir("/home/nas_main/jungwooahn/projects/DronePhotographerV12")
 from functools import partial
 
-from src.goal_authoring.from_language import (
-    LLMClassifier,
-    hybrid_classifier,
-    keyword_classifier,
-    language_to_goal,
-)
+from src.goal_authoring.author import author_goal
+from src.goal_authoring.from_language import keyword_classifier
 
 EXAMPLES = [
     "a dramatic low-angle close-up of the subject from the side",
@@ -22,21 +22,22 @@ EXAMPLES = [
 ]
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--llm", action="store_true", help="pure LLM classifier")
-ap.add_argument("--hybrid", action="store_true", help="keyword-primary + LLM gap-fill (recommended)")
-ap.add_argument("--model", default="Qwen/Qwen2.5-VL-7B-Instruct")
+ap.add_argument("--llm", default=None, help="hybrid classifier with this LLM (e.g. Qwen/Qwen3-8B)")
+ap.add_argument("--methods", default="bank,rules")
 args = ap.parse_args()
 
 clf = keyword_classifier
-if args.llm or args.hybrid:
-    print(f"loading LLM classifier: {args.model}", flush=True)
-    llm = LLMClassifier(args.model)
-    clf = partial(hybrid_classifier, llm=llm) if args.hybrid else llm
+if args.llm:
+    from src.goal_authoring.from_language import LLMClassifier, hybrid_classifier
+    print(f"loading LLM classifier: {args.llm}", flush=True)
+    clf = partial(hybrid_classifier, llm=LLMClassifier(args.llm))
 
 for text in EXAMPLES:
-    gp = language_to_goal(text, clf)
     print(f"\nREQUEST: {text}")
-    print(f"  categories: {gp.categories()}")
-    print(f"  profile:    { {k: round(v,1) for k,v in gp.values.items()} }")
-    print(f"  specified:  {sorted(gp.specified)}  (partial={gp.is_partial()})")
-    print(f"  -> prompt:  {gp.to_nl()}")
+    for m in args.methods.split(","):
+        g = author_goal(text, classifier=clf, method=m.strip())
+        print(f"  [{m.strip()}] parsed {g.request.categories()}")
+        print(f"       -> {g.categories}")
+        for w in g.warnings:
+            print(f"       ! {w}")
+        print(f"       prompt: {g.prompt}")

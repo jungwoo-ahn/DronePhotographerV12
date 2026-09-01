@@ -52,41 +52,50 @@ def language_to_goal(text: str, classifier: Classifier, *, project_feasible: boo
 _RULES: list[tuple[str, tuple[str, str]]] = [
     # shot size
     (r"\bextreme wide|establishing shot|very wide\b", ("shot_size", "extreme wide shot")),
+    (r"\bmedium[- ]wide|medium long\b", ("shot_size", "medium-wide shot")),   # before "wide shot": it contains it
     (r"\bwide shot|wide angle|full shot\b", ("shot_size", "wide shot")),
-    (r"\bmedium[- ]wide|medium long\b", ("shot_size", "medium-wide shot")),
     (r"\bmedium close[- ]?up|med close\b", ("shot_size", "medium close-up")),
     (r"\bheadshot|extreme close[- ]?up\b", ("shot_size", "close-up")),
     (r"\btight on the (face|head)|just the (face|head)|tight on the subject\b", ("shot_size", "close-up")),
     (r"\bclose[- ]?up|closeup|tight shot\b", ("shot_size", "close-up")),
     (r"\bportrait\b", ("shot_size", "medium close-up")),
-    (r"\bmedium shot|waist shot\b", ("shot_size", "medium shot")),
+    (r"\bmedium shot|waist shot|medium framing\b", ("shot_size", "medium shot")),
     # elevation
     (r"\bhigh[- ]angle|from above|looking down|bird'?s?[- ]eye|overhead\b", ("elevation", "high angle")),
     (r"\blow[- ]angle|from below|looking up|worm'?s?[- ]eye\b", ("elevation", "low angle")),
-    (r"\beye[- ]level|eye height|straight on\b", ("elevation", "eye level")),
-    # bearing (subject-relative)
+    (r"\beye[- ]level|eye height\b", ("elevation", "eye level")),
+    # bearing (subject-relative). Specific words first; "profile" alone is a side view.
     (r"\bfront[- ]right|three[- ]quarter front right\b", ("bearing", "front-right")),
     (r"\bfront[- ]left\b", ("bearing", "front-left")),
     (r"\bback[- ]right|rear right\b", ("bearing", "back-right")),
     (r"\bback[- ]left|rear left\b", ("bearing", "back-left")),
-    (r"\bfrom behind|from the back|rear view|back view|back of|behind them\b", ("bearing", "back")),
+    (r"\bfrom behind|from the back|rear view|back view|back of|behind them|their back\b", ("bearing", "back")),
+    (r"\bright profile|from (their|the subject's) right\b", ("bearing", "right")),
+    (r"\bleft profile|from (their|the subject's) left\b", ("bearing", "left")),
     (r"\bprofile|from the side|side view|side[- ]on\b", ("bearing", "side")),
     (r"\bfrom the right\b", ("bearing", "right")),
     (r"\bfrom the left\b", ("bearing", "left")),
-    (r"\bfrom the front|facing (the )?camera|head[- ]on|front view\b", ("bearing", "front")),
+    # "straight-on" describes the subject facing the lens, not the camera height — it used to be
+    # an eye-level rule and missed the bearing the gold set labels it with.
+    (r"\bfrom the front|facing (the )?camera|head[- ]on|front view|straight[- ]on|"
+     r"looking (right |straight )?at (us|me|the camera|the lens)\b", ("bearing", "front")),
     # placement x
     (r"\b(upper|lower|top|bottom)[- ]?left\b", ("placement_x", "left third")),      # compound e.g. "lower left"
     (r"\b(upper|lower|top|bottom)[- ]?right\b", ("placement_x", "right third")),
     (r"\b(on the |to the )?left third|left side|on the left\b", ("placement_x", "left third")),
     (r"\b(on the |to the )?right third|right side|on the right\b", ("placement_x", "right third")),
     (r"\bcenter(ed)?|middle of (the )?frame|centred\b", ("placement_x", "centered")),
-    # placement y
+    # placement y. "mid in the frame" is the training serializer's own word for the middle band.
     (r"\bupper|top of (the )?frame|near the top\b", ("placement_y", "upper")),
     (r"\blower|bottom of (the )?frame|near the bottom\b", ("placement_y", "lower")),
+    (r"\bmid in the frame|vertically cent(e)?red|mid[- ]height\b", ("placement_y", "mid")),
     # body framing
     (r"\bfull body|full[- ]length|head to toe\b", ("body_framing", "full body in frame")),
     (r"\btightly cropped|cropped (in )?tight|just the (face|head)\b", ("body_framing", "tightly cropped")),
     (r"\bpartially (cut|cropped)|partly out of frame\b", ("body_framing", "partially cut off")),
+    (r"\bmostly in frame\b", ("body_framing", "mostly in frame")),
+    (r"\bcropped at both|(the )?head and (the )?feet\b",
+     ("crop_side", "cropped at both the head and the feet")),          # before the head-only rule
     (r"\b(head|face) (is )?(cut|cropped)( off)?|cropped (above|at) the head|top (is )?cut\b",
      ("crop_side", "cropped above the head")),
     (r"\bcropped below the waist|waist[- ]up|from the waist up\b",

@@ -89,6 +89,7 @@ def test_profile_assembly_bearing_gated_and_elevation_unspecified():
 def test_reference_profile_serializes_to_prompt():
     kp = np.zeros((17, 3)); kp[5:13, 2] = 0.9
     gp = profile_from_detection((256, 192, 768, 576), kp, W, H, _MockBearing(0.0, 0.9))
-    nl = gp.to_nl()
+    nl = gp.to_prompt()
     assert "shot" in nl and "front" in nl        # bearing 0 -> "front"
     assert "angle" not in nl                      # elevation absent
+    assert set(GEOM_KEYS) <= gp.exact and SUBJECT_BEARING_KEY in gp.exact   # measurements are exact

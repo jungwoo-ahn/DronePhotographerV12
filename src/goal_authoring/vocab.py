@@ -6,8 +6,8 @@ Both goal-authoring front-ends share these tables:
     then `categories_to_profile` grounds them to numeric profile values.
   - Module 2 (reference image    -> goal profile): detection gives the geometric keys exactly; the
     semantic keys (bearing/elevation) are classified into these same categories.
-  - The goal->prompt serializer (`profile_to_nl`) that conditions Cosmos is the inverse of the above,
-    so profile <-> categories <-> NL round-trips consistently.
+  - The goal->prompt serializer that conditions Cosmos (`serialize.goal_prompt`) reads these same
+    tables, so profile <-> categories <-> prompt round-trips consistently.
 
 A category table is {label: (lo, hi, centroid)} in the profile key's RAW units. `_classify` maps a
 value to its band label; the centroid maps a label back to a representative value. The bearing axis
@@ -165,7 +165,7 @@ def categories_to_profile(cats: Mapping[str, str]) -> tuple[dict[str, float], fr
 
 
 # ---------------------------------------------------------------------------- #
-# profile  ->  natural language  (the conditioning-prompt serializer)
+# profile  ->  natural language
 # ---------------------------------------------------------------------------- #
 def profile_to_nl(
     profile: Mapping[str, float],
@@ -174,39 +174,20 @@ def profile_to_nl(
     numbers: bool = True,
     coarse_bearing: bool = False,
 ) -> str:
-    """Serialize a (partial) profile to a cinematography sentence — words + optional numbers.
-    Only the `specified` keys are described (partial goal -> shorter prompt)."""
+    """DEPRECATED — delegates to the training serializer (`serialize.profile_to_prompt`).
+
+    This used to build its own sentence ("a close-up (subject fills ~88% of frame), of the
+    subject seen from the front (0°) ..."), which was never what the policy was trained on;
+    demos, the report and a round-trip test all displayed it as "the prompt". There is one
+    serializer now. `numbers` / `coarse_bearing` are accepted and ignored: the training
+    sentence always carries the numbers and the sector8 word.
+    """
+    import warnings
+    from src.goal_authoring.serialize import profile_to_prompt
+    warnings.warn("vocab.profile_to_nl is deprecated; use serialize.profile_to_prompt",
+                  DeprecationWarning, stacklevel=2)
     spec = set(specified) if specified is not None else set(profile)
-    parts: list[str] = []
-
-    if "occupancy" in spec:
-        occ = float(profile["occupancy"])
-        s = _classify(occ, SHOT_SIZE)
-        parts.append(f"a {s}" + (f" (subject fills ~{round(occ)}% of frame)" if numbers else ""))
-    else:
-        parts.append("a shot")
-
-    if SUBJECT_BEARING_KEY in spec:
-        b = float(profile[SUBJECT_BEARING_KEY])
-        word = sector3(b) if coarse_bearing else sector8(b)
-        parts.append(f"of the subject seen from the {word}"
-                     + (f" ({round(b)}°)" if numbers and not coarse_bearing else ""))
-    else:
-        parts.append("of the subject")
-
-    if "cam_to_obj_elevation_deg" in spec:
-        parts.append(f"at {_classify(float(profile['cam_to_obj_elevation_deg']), ELEVATION)}")
-
-    px = _classify(float(profile["object_center_x"]) / RENDER_WIDTH, PLACE_X) if "object_center_x" in spec else None
-    py = _classify(float(profile["object_center_y"]) / RENDER_HEIGHT, PLACE_Y) if "object_center_y" in spec else None
-    loc = " ".join(w for w in (py, px) if w)
-    if loc:
-        parts.append(f"subject positioned {loc} of the frame")
-
-    if "body_in_frame_ratio" in spec:
-        parts.append(_classify(float(profile["body_in_frame_ratio"]), BODY_FRAMING))
-
-    return ", ".join(parts) + "."
+    return profile_to_prompt(profile, spec)
 
 
 # machine-readable JSON goal (Cosmos ActionPromptJsonFormatter-friendly alternative to prose)

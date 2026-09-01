@@ -71,7 +71,7 @@ def module1_cards():
         cards.append(f"""<div class="card m1">
 <div class="nl">“{p}”</div>
 <div class="chips">{chips(gp.categories()) or '<span class=chip>(none parsed)</span>'}</div>
-<div class="prompt">→ {gp.to_nl()}</div></div>""")
+<div class="prompt">→ {gp.to_prompt()}</div></div>""")
     return "\n".join(cards)
 
 
@@ -82,7 +82,7 @@ def module1_roundtrip(profiles):
     for prof in profiles:
         gp0 = GoalProfile.from_full_profile(prof)
         cats0 = gp0.categories()
-        cats1 = language_to_goal(gp0.to_nl(), keyword_classifier, project_feasible=False).categories()
+        cats1 = language_to_goal(gp0.to_prompt(), keyword_classifier, project_feasible=False).categories()
         for ax, lb in cats0.items():
             per_axis_tot[ax] = per_axis_tot.get(ax, 0) + 1
             if cats1.get(ax) == lb:
@@ -262,7 +262,7 @@ def main():
                 f'<div class="col"><div class="lbl">reference (overlay)</div>'
                 f'<img src="data:image/jpeg;base64,{b64(overlay(ip, det, gp),240)}"></div>'
                 f'<div class="col"><div class="lbl">recon: same composition, other subject</div>{recon}</div>'
-                f'</div><div class="prompt">→ {gp.to_nl()}</div>'
+                f'</div><div class="prompt">→ {gp.to_prompt()}</div>'
                 f'<table class="cmp">{"".join(rows)}</table></div>')
         return html, misses
 

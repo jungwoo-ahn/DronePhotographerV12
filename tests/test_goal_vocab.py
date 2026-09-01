@@ -48,23 +48,28 @@ def test_partial_goal_only_specifies_given_axes():
     assert spec == frozenset({"occupancy"})
     assert set(vals) == {"occupancy"}
     gp = GoalProfile(vals, spec)
-    nl = gp.to_nl()
+    nl = gp.to_prompt()
     assert "close-up" in nl
-    # unspecified axes are NOT asserted in the prompt
+    # unspecified axes are NOT asserted in the (partial) prompt
     assert "angle" not in nl and "third" not in nl
+    assert not gp.is_complete() and "cam_to_obj_elevation_deg" in gp.missing()
 
 
-def test_nl_serializer_words_and_numbers():
+def test_prompt_serializer_words_and_numbers():
     gp = GoalProfile.from_categories({
         "shot_size": "close-up", "bearing": "front", "elevation": "low angle",
         "placement_x": "left third", "placement_y": "lower", "body_framing": "full body in frame",
     })
-    nl = gp.to_nl(numbers=True)
+    nl = gp.to_prompt()
     for w in ["close-up", "front", "low angle", "left third", "lower", "full body in frame"]:
         assert w in nl, f"missing '{w}' in: {nl}"
     assert "%" in nl and "°" in nl  # numbers included
-    coarse = GoalProfile.from_categories({"bearing": "back-left"}).to_nl(coarse_bearing=True)
-    assert "side" in coarse or "back" in coarse  # sector3 collapses the 8-way label
+    assert nl.startswith("Move the camera to achieve this shot:")   # the TRAINING serializer, not a second one
+    import warnings
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        assert gp.to_nl() == nl                                       # deprecated alias, same string
+    assert any(issubclass(r.category, DeprecationWarning) for r in rec)
 
 
 def test_feasibility_clamps_and_wraps():
