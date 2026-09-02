@@ -153,6 +153,21 @@ def main() -> int:
     episodes = json.loads(epf.read_text())["episodes"]
     print(f"[real2sim] {len(episodes)} episodes from {meta['name']}", flush=True)
 
+    # The subject is per-EPISODE, not per-run: episodes are generated across several
+    # assets and each one's goal profile was computed from THAT asset's mesh. Rendering a
+    # single fixed subject would show a different body than the goal was scored against,
+    # silently undoing the subject diversity.
+    obj_root = Path(args.object_blend).resolve().parent.parent
+
+    def object_blend_for(ep):
+        name = ep.get("subject")
+        if not name:
+            return str(Path(args.object_blend).resolve())
+        cand = obj_root / name / f"{name}.blend"
+        if not cand.exists():
+            raise FileNotFoundError(f"subject blend not found for episode: {cand}")
+        return str(cand)
+
     run_info = {
         "input_scene": str(Path(args.scene_blend).resolve()),
         "input_object": str(Path(args.object_blend).resolve()),
@@ -185,6 +200,7 @@ def main() -> int:
     for i, ep in enumerate(episodes):
         if ep["key"] in done:
             continue
+        run_info["input_object"] = object_blend_for(ep)
         run_info["options"]["object_position"] = ep["subject_foot"]
         rip.write_text(json.dumps(run_info))
         env = BlenderRolloutEnv(str(rip), renderer, object_position=ep["subject_centre"])
