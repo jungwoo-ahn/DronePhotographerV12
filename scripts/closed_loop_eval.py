@@ -110,6 +110,17 @@ ap.add_argument("--val-scenes", default=DEFAULT_VAL_SCENES,
                      "Pass '' to fall back to replaying the export enumeration, which is "
                      "how every pre-v5 number defined held-out (never-sampled placements, "
                      "whose SCENES the model had still trained on).")
+ap.add_argument("--episodes-from", default="",
+                help="replay a shared episode manifest (scripts/build_eval_episodes.py) instead "
+                     "of drawing episodes here. This is what makes a number comparable with "
+                     "another policy: the score is dominated by how far the start is "
+                     "(corr(d_start, improvement) = 0.66 over 138 rollouts), so two policies "
+                     "measured on two episode sets are not comparable however identical the "
+                     "protocol. Empty = draw as before. NEVER give this a relative default: this "
+                     "script chdirs into the vendored framework.")
+ap.add_argument("--write-episodes", default="",
+                help="dump the episodes this run selected as a manifest and exit — how an "
+                     "existing run becomes shareable.")
 ap.add_argument("--samples", type=int, default=1,
                 help="draws per chunk, averaged before execution. 1 reproduces every earlier "
                      "number. K>1 targets a measured weakness: the shoot probe fired on only "
@@ -123,6 +134,27 @@ ap.add_argument("--shoot-threshold", type=float, default=0.5)
 ap.add_argument("--seed", type=int, default=0)
 ap.add_argument("--no-ema", action="store_true", help="load raw weights instead of EMA")
 args = ap.parse_args()
+
+
+def _repo_path(p: str) -> str:
+    """Resolve a path argument against the REPO, never the cwd.
+
+    This script does `os.chdir(CF_ROOT)` because Cosmos resolves model configs by relative path.
+    Every path that arrives on the command line is therefore ambiguous, and the two ends of one
+    can even disagree: `--out runs/closed_loop/x.json` made `write_run_info` create the run_info
+    under the vendored framework while the Blender subprocess, which runs with `cwd` set to the
+    shared repo, looked for it there and died `FileNotFoundError` on all five episodes.
+
+    Fifth appearance of one bug -- it killed a training run, was fixed in the dataset module,
+    came back as a `--val-scenes` default and killed three rollouts, caught the new manifest
+    flags, then this. Normalising every path flag in one place is the end of it. Same rule as
+    `src/data/cosmos_camera_dataset.py`.
+    """
+    return p if (not p or Path(p).is_absolute()) else str(Path(V12) / p)
+
+
+for _flag in ("out", "root", "val_scenes", "episodes_from", "write_episodes", "checkpoint"):
+    setattr(args, _flag, _repo_path(getattr(args, _flag)))
 
 # ---------------------------------------------------------------- policy
 from cosmos_framework.inference.common.init import init_script  # noqa: E402
@@ -150,6 +182,7 @@ from src.common.goal_space import (  # noqa: E402
     DEFAULT_GOAL_KEYS, SUBJECT_BEARING_KEY, goal_vector,
 )
 from src.common.reward import CameraIntrinsics, pose_to_geometry, _geometry_distance  # noqa: E402
+from src.common.run_info import to_policy_frame  # noqa: E402
 from src.common.run_info import write_run_info as _write_run_info  # noqa: E402
 from src.data.cosmos_camera_dataset import CAMERA_ACTION_DIM, DOMAIN_NAME  # noqa: E402
 from src.data.lerobot_export import goal_prompt  # noqa: E402
@@ -231,6 +264,9 @@ def predict_chunk(model, frame_uint8: np.ndarray, prompt: str, seed: int) -> np.
     The batch is rebuilt every call on purpose: the model normalizes video in place
     and stamps `is_preprocessed`, so a reused dict silently takes the float branch.
     """
+    # The render is at the training ASPECT (4:3); squash it to the square the policy
+    # was trained on. A native square render would widen the vertical FOV by 4/3.
+    frame_uint8 = to_policy_frame(frame_uint8, args.image_size)
     video = torch.from_numpy(frame_uint8).permute(2, 0, 1).contiguous()      # [C,H,W]
     video = video.unsqueeze(1).repeat(1, args.chunk_size + 1, 1, 1)          # [C,T,H,W]
     batch = build_action_batch(
@@ -471,9 +507,81 @@ def pick_episodes() -> list:
     return picked
 
 
+def episodes_from_manifest(path: str) -> list:
+    """Replay a shared manifest into exactly what `pick_episodes` returns.
+
+    A window is looked UP, not re-drawn: the manifest names `(pair_idx, start_frame_idx,
+    goal_frame_idx)` and this enumerates the same pool to find it. Absent means the pool
+    differs (a different root, chunk_size or max_per_pair), which is a fault to surface — a
+    silent substitution would hand back a different shot under the right name.
+
+    `d_start` is then recomputed from the window and checked against the manifest. It is pure
+    pose math, so agreement proves both repos are rolling out the same episode; the check runs
+    before the model is loaded, so a mismatch costs nothing.
+    """
+    doc = json.loads(Path(path).read_text())
+    chunk, per_pair = int(doc.get("chunk_size", 8)), int(doc.get("max_per_pair", 2))
+    if chunk != args.chunk_size:
+        raise SystemExit(f"manifest was built with chunk_size={chunk} but --chunk-size is "
+                         f"{args.chunk_size}; the window pool itself would differ")
+    picked, worst = [], 0.0
+    for ep in doc["episodes"]:
+        path_j = Path(ep["data_json"])
+        if not path_j.exists():                     # another repo may hold the tree elsewhere
+            path_j = Path(args.root) / ep["placement"] / "data.json"
+        want = (ep["pair_idx"], ep["start_frame_idx"], ep["goal_frame_idx"])
+        found = None
+        for w in iter_goal_start_windows(path_j, chunk_size=chunk, max_per_pair=per_pair):
+            if (w.pair_idx, w.start_frame_idx, w.goal_frame.frame_idx) == want:
+                found = w
+                break
+        if found is None:
+            raise SystemExit(f"{ep['key']}: window {want} is not in the pool for {path_j} — "
+                             "the manifest and this checkout disagree about the data")
+        g = goal_vector(found.goal_frame.raw, DEFAULT_GOAL_KEYS, object_key=_window_object(found))
+        if not np.isfinite(g).all():
+            raise SystemExit(f"{ep['key']}: goal vector is not finite here")
+        d0 = geometry_distance(np.asarray(found.start.camera_position, dtype=np.float64),
+                               np.asarray(found.start.camera_forward, dtype=np.float64),
+                               np.asarray(found.start.camera_up, dtype=np.float64),
+                               found.goal_frame, None)
+        worst = max(worst, abs(d0 - float(ep["d_start"])))
+        picked.append((ep["placement"], str(path_j), found, g, float(ep["bearing"]),
+                       ep["sector"]))
+    if worst > 1e-6:
+        raise SystemExit(f"d_start disagrees with the manifest by up to {worst:.2e} — these are "
+                         "not the same episodes; refusing to spend GPU on an incomparable run")
+    print(f"[eval] manifest {path}: {len(picked)} episodes replayed, "
+          f"d_start matches to {worst:.1e}", flush=True)
+    return picked
+
+
+def write_manifest(episodes: list, path: str) -> None:
+    """Dump selected episodes in the shape `scripts/build_eval_episodes.py` writes."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "build_eval_episodes", Path(V12) / "scripts" / "build_eval_episodes.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    out = [mod.materialise(name, Path(p), w, g, bearing, sec)
+           for name, p, w, g, bearing, sec in episodes]
+    dest = Path(path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(
+        {"_what": "Episodes selected by a closed_loop_eval run, dumped for sharing.",
+         "version": 1, "source_root": args.root, "val_scenes": args.val_scenes,
+         "chunk_size": args.chunk_size, "max_per_pair": 2, "seed": args.seed,
+         "n_episodes": len(out), "episodes": out}, indent=1))
+    print(f"[eval] wrote {dest} ({len(out)} episodes)")
+
+
 def main() -> int:
     t0 = time.time()
-    episodes = pick_episodes()
+    episodes = (episodes_from_manifest(args.episodes_from) if args.episodes_from
+                else pick_episodes())
+    if args.write_episodes:
+        write_manifest(episodes, args.write_episodes)
+        return 0
     print(f"[eval] {len(episodes)} episodes", flush=True)
     if not episodes:
         print("[eval] nothing to evaluate", flush=True)
@@ -493,8 +601,11 @@ def main() -> int:
         try:
             prev = json.loads(_partial_path.read_text()).get("episodes", [])
             results = list(prev)
-            done_keys = {(e.get("placement"), e.get("start_frame_image"),
-                          e.get("goal_frame_image")) for e in prev}
+            # `key` when present, the old path triple otherwise, so partials written before the
+            # key existed still resume.
+            done_keys = {e["key"] if e.get("key") else
+                         (e.get("placement"), e.get("start_frame_image"), e.get("goal_frame_image"))
+                         for e in prev}
             print(f"[eval] resuming: {len(results)} episodes already done", flush=True)
         except Exception as exc:  # noqa: BLE001
             print(f"[eval] partial unreadable, starting fresh: {exc}", flush=True)
@@ -509,7 +620,9 @@ def main() -> int:
 
     _failed = 0
     for i, (name, path, window, goal_vec, bearing, sec) in enumerate(episodes):
-        if (name, window.start.image, window.goal_frame.image) in done_keys:
+        _key = (f"{name}:p{window.pair_idx:02d}:s{window.start_frame_idx:02d}"
+                f":g{window.goal_frame.frame_idx:02d}")
+        if _key in done_keys or (name, window.start.image, window.goal_frame.image) in done_keys:
             continue
         try:
             delta = abs(window.goal_frame.frame_idx - window.start_frame_idx)
@@ -573,6 +686,10 @@ def main() -> int:
             d1 = trace[-1]
             d_best = float(min(trace))
             results.append({
+                # Join key across repos and runs. The old identity was a triple of absolute
+                # image paths, which does not survive a checkout in another location.
+                "key": f"{name}:p{window.pair_idx:02d}:s{window.start_frame_idx:02d}"
+                       f":g{window.goal_frame.frame_idx:02d}",
                 "placement": name, "object": _window_object(window),
                 "sector": sec, "bearing": bearing, "delta": delta, "chunks": n_chunks,
                 # Logged even when --stop-on-shoot is off, so a fixed-length rollout still
@@ -597,6 +714,13 @@ def main() -> int:
             _tmp.write_text(json.dumps(
                 {"summary": {"checkpoint": args.checkpoint, "episodes": len(results),
                              "held_out_only": bool(args.held_out_only), "split": args.split,
+        # A failed episode is simply absent from `results`, so a run that could not render a
+        # whole scene reported a smaller n and nothing else. Measured: the August 138-episode
+        # run contains ZERO Parking_70ae1f27 episodes because that scene reproducibly segfaults
+        # Cycles here (rc=-11) -- so the headline v5 numbers were on seven of the eight held-out
+        # scenes and no one could see it. Say what was attempted and what did not survive.
+        "attempted": len(episodes), "failed": _failed,
+        "scenes_completed": sorted({r["placement"].split("__")[0] for r in results}),
                              "frames_dir": str(frames_dir), "partial": True},
                  "episodes": results}, indent=1))
             _tmp.replace(_partial)
@@ -617,6 +741,21 @@ def main() -> int:
         return 1
     imp = np.array([r["improvement"] for r in results])
     best = np.array([r["best_improvement"] for r in results])
+    d_end = np.array([r["d_end"] for r in results])
+    d_best = np.array([r["d_best"] for r in results])
+    d_st = np.array([r["d_start"] for r in results])
+    # A radian of `reward.py` distance means nothing to a photographer, so say what it buys.
+    # Calibrated in scripts/calibrate_shot_threshold.py against real frame pairs: two frames
+    # this far apart carry the same six cinematography words 69% / 66% / 50% of the time.
+    # `success_best` is the same at the closest point of the path, and the gap between the two
+    # is the cost of not knowing when to stop.
+    taus = (0.05, 0.10, 0.20)
+    success = {f"success@{t:.2f}": float((d_end <= t).mean()) for t in taus}
+    success_best = {f"success_best@{t:.2f}": float((d_best <= t).mean()) for t in taus}
+    # Median of the per-episode ratio, not a ratio of means: improvement scales with d_start
+    # (corr 0.66), and the mean is dragged by a thin negative tail (9/138 episodes, worst -2.06,
+    # together worth -6.6 of a total 75.8).
+    closure = 1.0 - d_end / np.maximum(d_st, 1e-9)
     by_sector = {}
     for r in results:
         by_sector.setdefault(r["sector"], []).append(r["improvement"])
@@ -632,7 +771,22 @@ def main() -> int:
         "frac_positive": float((imp > 0).mean()),
         "mean_d_start": float(np.mean([r["d_start"] for r in results])),
         "mean_d_end": float(np.mean([r["d_end"] for r in results])),
+        "mean_d_best": float(d_best.mean()),
+        "median_closure": float(np.median(closure)),
+        **success, **success_best,
+        "shot_threshold_note": "success@t = fraction whose FINAL frame is within t radians of "
+                               "the goal; at t = 0.05/0.10/0.20 two real frames that close read "
+                               "as the same shot 69/66/50% of the time "
+                               "(runs/eval/shot_threshold.json).",
+        "episodes_from": args.episodes_from,
         "held_out_only": bool(args.held_out_only), "split": args.split,
+        # A failed episode is simply absent from `results`, so a run that could not render a
+        # whole scene reported a smaller n and nothing else. Measured: the August 138-episode
+        # run contains ZERO Parking_70ae1f27 episodes because that scene reproducibly segfaults
+        # Cycles here (rc=-11) -- so the headline v5 numbers were on seven of the eight held-out
+        # scenes and no one could see it. Say what was attempted and what did not survive.
+        "attempted": len(episodes), "failed": _failed,
+        "scenes_completed": sorted({r["placement"].split("__")[0] for r in results}),
         "frames_dir": str(frames_dir),
         "guidance": args.guidance, "num_steps": args.num_steps,
         "chunks": args.chunks, "ema": not args.no_ema,

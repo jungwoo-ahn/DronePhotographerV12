@@ -37,7 +37,11 @@ export WAN_VAE_PATH="$CF/examples/checkpoints/wan22_vae/Wan2.2_VAE.pth"
 # The recipe interpolates ${oc.env:CAMERA_ROOT} when the config is built. Inference
 # never reads the dataset, but the interpolation still has to resolve or the config
 # raises before the model is even constructed.
-export CAMERA_ROOT="${CAMERA_ROOT:-$V12/runs/lerobot_v1}"
+# Must be the v5 export: its action width is 10, and lerobot_v1's is 9, so the recipe would
+# describe a different model than the checkpoint. Inference never reads the dataset, but the
+# ${oc.env:CAMERA_ROOT} interpolation has to resolve before the model is constructed. Same
+# reasoning as scripts/sbatch_shoot_probe.sh, which was already on v5 while this was not.
+export CAMERA_ROOT="${CAMERA_ROOT:-$V12/runs/lerobot_v5}"
 export IMAGINAIRE_OUTPUT_ROOT="${IMAGINAIRE_OUTPUT_ROOT:-$V12/runs/train}"
 export BASE_CHECKPOINT_PATH="${BASE_CHECKPOINT_PATH:-$CF/examples/checkpoints/Cosmos3-Nano}"
 export PYTORCH_ALLOC_CONF=expandable_segments:True

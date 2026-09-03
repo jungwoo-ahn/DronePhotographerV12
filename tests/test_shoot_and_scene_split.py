@@ -145,20 +145,64 @@ def test_relative_manifest_resolves_against_the_repo_not_the_cwd(tmp_path, monke
     assert resolved.exists(), resolved
 
 
+# Every flag naming a file that a Cosmos-facing script reads. The list grows; the bug does not
+# change. `--episodes-from` / `--write-episodes` joined it after being caught the same way on
+# their very first run.
+_MANIFEST_FLAGS = ("--val-scenes", "--episodes-from", "--write-episodes")
+
+
 def test_no_script_defaults_the_manifest_to_a_relative_path():
-    """Third occurrence of one bug, so pin it.
+    """Fourth occurrence of one bug, so pin it.
 
     Scripts that talk to Cosmos do `os.chdir(CF_ROOT)` because the framework resolves model
     configs by relative path. A relative "configs/val_scenes.json" default is therefore looked
     for inside the vendored checkout. It killed a training run, was fixed in the dataset
-    module, then came back as a NEW --val-scenes flag and killed all three rollouts at once.
+    module, came back as a NEW --val-scenes flag and killed all three rollouts at once, then
+    caught the shared-manifest flags too.
+
+    An empty default is fine — it means "off" — and so is an absolute constant; what is banned
+    is a non-empty relative string literal.
     """
     import re
     bad = []
     for path in Path("scripts").glob("*.py"):
-        for m in re.finditer(r'"--val-scenes",\s*default=([^,)\n]+)', path.read_text()):
-            expr = m.group(1).strip()
-            if expr.startswith('"') or expr.startswith("'"):
-                bad.append(f"{path.name}: default={expr}")
-    assert not bad, ("--val-scenes must default to the absolute DEFAULT_VAL_SCENES constant, "
-                     f"not a string literal: {bad}")
+        text = path.read_text()
+        for flag in _MANIFEST_FLAGS:
+            for m in re.finditer(rf'"{flag}",\s*(?:dest=[^,]+,\s*)?default=([^,)\n]+)', text):
+                expr = m.group(1).strip()
+                if expr.startswith(('"', "'")) and expr.strip("\"'"):
+                    bad.append(f"{path.name}: {flag} default={expr}")
+    assert not bad, ("a manifest flag must default to an absolute constant or to '' (off), "
+                     f"never to a relative string literal: {bad}")
+
+
+def test_manifest_flags_resolve_a_relative_value_against_the_repo():
+    """A default is not the only way in: a user typing `--episodes-from configs/x.json` hits
+    the same chdir. `closed_loop_eval._repo_path` is what makes that work, so require every
+    script offering these flags to carry that resolution."""
+    offenders = []
+    for path in Path("scripts").glob("*.py"):
+        text = path.read_text()
+        if "os.chdir(CF_ROOT)" not in text:
+            continue
+        if not any(f'"{f}"' in text for f in _MANIFEST_FLAGS[1:]):
+            continue
+        if "_repo_path" not in text:
+            offenders.append(path.name)
+    assert not offenders, (f"{offenders} take a manifest path but never resolve it against the "
+                           "repo, so a relative value resolves inside the vendored framework")
+
+
+def test_closed_loop_eval_normalises_every_path_flag():
+    """`--out` was the one that got through: the script writes the run_info relative to the
+    vendored framework while the Blender subprocess, whose cwd is the shared repo, reads it
+    from there — FileNotFoundError on every episode. So the rule is not "the manifest flags"
+    but "every path flag", checked here rather than remembered."""
+    import re
+    src = Path("scripts/closed_loop_eval.py").read_text()
+    m = re.search(r"for _flag in \(([^)]*)\):\s*\n\s*setattr\(args, _flag, _repo_path",
+                  src)
+    assert m, "closed_loop_eval no longer normalises its path flags in one place"
+    normalised = set(re.findall(r'"([a-z_]+)"', m.group(1)))
+    for flag in ("out", "root", "val_scenes", "episodes_from", "write_episodes"):
+        assert flag in normalised, f"--{flag.replace('_', '-')} is not repo-anchored"
