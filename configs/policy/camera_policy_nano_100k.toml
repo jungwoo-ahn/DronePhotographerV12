@@ -1,0 +1,86 @@
+# Train `camera_policy_nano_v6` from the Cosmos3-Nano base to 100,000 iterations on 8 GPUs.
+#
+#   sbatch --qos=own --gres=gpu:8 --mem=768G scripts/sbatch_train_camera.sh \
+#       --sft-toml configs/policy/camera_policy_nano_100k.toml
+#
+# A RESTART, NOT A CONTINUATION. v5 stopped at 40k because its schedule ended there, and the
+# attempt to continue it made it worse: at f_max 0.9 (4.5e-5) the held-out action loss went
+# from 0.00073 at iteration 40000 to 0.0011-0.0018 over 46k-54k, with train moving the same
+# way (0.0002 -> 0.0008) and the val-train gap unchanged -- an LR too large for the basin the
+# first 40k had annealed into, not overfitting. iter_000040000 itself was then deleted by a
+# retention rule that could not know it mattered, and nothing better survives it. A single
+# clean cycle is both the recovery and the improvement.
+#
+# EIGHT GPUS BUY A BIGGER BATCH, NOT A SHORTER RUN. The recipe is FSDP data-parallel at
+# batch_size=1 per rank, so 2 -> 8 GPUs multiplies the GLOBAL batch by 4 and leaves the
+# iteration rate roughly where it was. 100k is still ~7 days; what changes is that the model
+# sees ~800k samples instead of ~200k.
+
+[job]
+task       = "vfm"
+experiment = "action_policy_camera_nano"
+project    = "cosmos3_camera_policy"
+group      = "action_sft"
+# MUST be a name with no run directory yet. The checkpointer resumes whenever it finds
+# `latest_checkpoint.txt` under <output_root>/<project>/<group>/<name>, and that wins over
+# `load_path` -- reusing `camera_policy_nano_v5` here would silently continue the damaged
+# trajectory this config exists to abandon.
+name       = "camera_policy_nano_v6"
+wandb_mode = "offline"
+
+[model]
+precision = "bfloat16"
+max_num_tokens_after_packing = 24000
+
+[model.parallelism]
+# Overridden by scripts/sbatch_train_camera.sh from the GPUs the job actually got.
+data_parallel_shard_degree     = 8
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+mode           = "selective"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[optimizer]
+# Unchanged from the run that produced the good 40k model. It is the only learning rate with
+# evidence on this task, and at 4x the batch keeping it is the conservative direction: less
+# gradient noise for the same step size. If the curve is clearly behind v5's at matched SAMPLE
+# count, 1e-4 (sqrt scaling) is the first thing to try -- as a separate run, not a mid-run edit.
+# The last time this number moved mid-run it cost the model.
+lr = 5.0e-05
+
+[scheduler]
+# ONE cycle. The lengths must sum to trainer.max_iter: LambdaLinearScheduler.find_in_interval
+# returns None past the end of the list and the run dies indexing with it -- it took out a run
+# at exactly iteration 2000 when cycle_lengths was [2000].
+#
+# warm_up 500, not the 100 the 40k run used, because the global batch is 4x larger; everything
+# else here is what the 40k run had.
+cycle_lengths = [100000]
+warm_up_steps = [500]
+f_max         = [1.0]
+f_min         = [0.0]
+f_start       = [1.0e-06]
+
+[trainer]
+max_iter        = 100000
+grad_accum_iter = 1
+logging_iter    = 1
+
+[checkpoint]
+# No latest_checkpoint.txt under a fresh job.name, so this is what gets loaded: the public
+# Cosmos3-Nano base, with keys_to_skip_loading dropping net_ema and the action heads and
+# load_training_state=False. Same path the 40k run took.
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+# 1000 MUST stay a multiple of HeldOutLossProbe(every_n=500). CheckpointRetention credits a
+# checkpoint with a metric only when the probe published at that exact iteration, so a
+# save_iter that misses the probe's cadence silently turns keep_best into nothing -- and
+# keep_best is the rule that is supposed to protect the best model from the janitor.
+#
+# ~1.7 h between saves at the measured rate. Retention (action_policy_camera_nano.py) keeps
+# every 10k, the last 5, the best 5 by held-out action loss, and anything with a KEEP file:
+# at most 20 x 137 GB = 2.7 TB, against ~13 TB if nothing pruned at this interval.
+save_iter = 1000

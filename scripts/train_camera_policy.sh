@@ -15,7 +15,10 @@ CF="$V12/repos/cosmos-framework"
 VENV="$CF/.venv"
 SP="$VENV/lib/python3.13/site-packages"
 
-: "${CAMERA_ROOT:=$V12/runs/lerobot_v1}"
+# lerobot_v5, not v1: v1's actions are 9 wide against the 10 this recipe and every v5
+# checkpoint use, and v1 also predates the `scene` provenance column the scene-level split
+# needs. Both would surface, but only after the model had loaded.
+: "${CAMERA_ROOT:=$V12/runs/lerobot_v5}"
 : "${BASE_CHECKPOINT_PATH:=$CF/examples/checkpoints/Cosmos3-Nano}"
 : "${WAN_VAE_PATH:=$CF/examples/checkpoints/wan22_vae/Wan2.2_VAE.pth}"
 : "${IMAGINAIRE_OUTPUT_ROOT:=$V12/runs/train}"

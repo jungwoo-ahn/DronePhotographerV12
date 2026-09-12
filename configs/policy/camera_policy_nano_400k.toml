@@ -1,0 +1,99 @@
+# Continue `camera_policy_nano_v5` from iteration 40,000 to 400,000.
+#
+#   sbatch --qos=extra scripts/sbatch_train_camera.sh --sft-toml configs/policy/camera_policy_nano_400k.toml
+#
+# The run stopped at 40k because that is where its schedule ended, not because it had
+# converged: the held-out action loss was still falling (0.00384 @500 -> 0.00067 @24.5k ->
+# 0.00057 @40k), though it is flattening, and the last stretch is partly the LR annealing to
+# zero rather than the model improving. Two things are worth knowing before spending the GPU:
+# the held-out VISION loss went the other way over the same run (0.157 -> 0.250 while its
+# train counterpart fell 0.147 -> 0.053), so the imagination is already overfitting; and
+# 360k more iterations at the measured 593 iter/h on 2 GPUs is about 25 days.
+#
+# RESUMING IN PLACE. `job.name` must stay `camera_policy_nano_v5`: the checkpointer resumes by
+# finding `latest_checkpoint.txt` under <output_root>/<project>/<group>/<name>, and takes the
+# optimizer and scheduler state with it. A new name would silently start from the base
+# checkpoint again.
+
+[job]
+task       = "vfm"
+experiment = "action_policy_camera_nano"
+project    = "cosmos3_camera_policy"
+group      = "action_sft"
+name       = "camera_policy_nano_v5"
+wandb_mode = "offline"
+
+[model]
+precision = "bfloat16"
+max_num_tokens_after_packing = 24000
+
+[model.parallelism]
+# Overridden by scripts/sbatch_train_camera.sh from the GPUs the job actually got.
+data_parallel_shard_degree     = 2
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+mode           = "selective"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[optimizer]
+lr = 5.0e-05
+
+[scheduler]
+# THREE cycles: what the original run did, what the first continuation attempt did, and what
+# runs from here. The scheduler's state is restored on resume but the SHAPE is not — the
+# lambda is rebuilt from these values and only `last_epoch` comes back — so the earlier
+# cycles have to keep describing what already happened, or the restored step count would be
+# read against a curve that never ran.
+#
+# CYCLE 3 EXISTS BECAUSE CYCLE 2's PEAK WAS TOO HIGH. Continuing at f_max 0.9 (4.5e-5, 90% of
+# the original peak) knocked the model out of the minimum the first 40k had annealed into,
+# and it did not come back: over 46k-54k the held-out action loss sat at 0.0014-0.0018
+# against 0.00073 at iteration 40000, drifting up 10% across the window rather than down.
+# Train moved with it (0.0002 -> 0.0008) and the val-train gap barely changed (+0.00046 ->
+# +0.0007), so this is not overfitting — both losses are simply higher, which is what a
+# learning rate too large for the current basin looks like.
+#
+# 0.2 is 1e-5, a fifth of the original peak. The question it answers is cheap: if the
+# held-out loss falls back toward 0.0009 within a few thousand iterations, the diagnosis was
+# right and the run continues from a sane rate; if it stays flat and elevated, the rate is
+# still too high and the next step is lower still, not longer.
+#
+# The boundary is the iteration actually banked when the switch was made, so cycle 2's length
+# is what really ran at the higher rate. The lengths must sum to trainer.max_iter:
+# LambdaLinearScheduler.find_in_interval returns None past the end of the list and the run
+# dies indexing with it.
+cycle_lengths = [40000, 14000, 346000]
+warm_up_steps = [100, 2000, 500]
+f_max         = [1.0, 0.9, 0.2]
+f_min         = [0.0, 0.0, 0.0]
+f_start       = [1.0e-06, 1.0e-06, 1.0e-06]
+
+[trainer]
+max_iter        = 400000
+grad_accum_iter = 1
+logging_iter    = 1
+
+[checkpoint]
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+# Ignored while resuming — `latest_checkpoint.txt` wins over `load_path` in the checkpointer's
+# priority order — but it has to resolve, and it is what a fresh run would start from.
+#
+# 500, not the 1000 the 40k run used, because this one lives on preemptible capacity. A save
+# interval only helps if a link survives long enough to reach it: the first attempt on `share`
+# was preempted after 11 minutes -- about 109 iterations -- so it never banked anything and
+# every restart redid the same work. 500 is ~50 minutes at the measured 593 iter/h, which most
+# `extra` links should clear, and it also brings the framework's emergency save within reach
+# (TerminationSignalCheckpoint refuses to write unless save_iter/3 iterations have passed).
+#
+# The cost is I/O: 137 GB per save, so ~46 MB/s sustained. Retention
+# (configs/policy/action_policy_camera_nano.py) keeps the best by held-out loss, every 10k, the
+# last three, and anything with a `KEEP` file in it: ~5.3 TB by 400k, against ~110 TB if nothing
+# pruned at this interval. It was every 100k until 2026-09-12, which deleted iter_000040000 --
+# the checkpoint every published v5 number was measured on and, at 0.00073 held-out, better than
+# anything that survived it. A checkpoint is cheap to keep and expensive to recreate; the
+# interval should reflect that asymmetry, not disk.
+save_iter = 500

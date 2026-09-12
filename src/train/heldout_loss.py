@@ -49,6 +49,14 @@ except Exception:  # noqa: BLE001
 
 from cosmos_framework.utils.callback import Callback
 
+from src.train import metric_bus
+
+# The tag this probe publishes for the ACTION loss on the held-out scenes, and the one
+# CheckpointRetention ranks "best" by. Named here rather than retyped there: the two have to
+# agree exactly or retention silently finds nothing and keeps the newest instead, which is
+# the failure it had before the noticeboard existed.
+HELDOUT_VAL_ACTION_KEY = "heldout/val_flow_matching_loss_action"
+
 _LOSS_KEYS = (
     "flow_matching_loss_action",
     "flow_matching_loss_vision",
@@ -183,8 +191,13 @@ class HeldOutLossProbe(Callback):
             payload["heldout/ratio"] = v / t if t > 1e-12 else float("nan")
             print(f"[heldout] iter {iteration}: val {v:.5f} | train {t:.5f} | "
                   f"gap {v - t:+.5f}", flush=True)
-        if payload and wandb is not None and getattr(wandb, "run", None):
-            wandb.log(payload, step=iteration)   # the TB mirror picks this up
+        if payload:
+            # Also on the noticeboard, so CheckpointRetention can rank checkpoints by the
+            # held-out loss instead of degrading to keep-newest. wandb is the display path;
+            # this is the one another callback can read.
+            metric_bus.publish(payload, iteration)
+            if wandb is not None and getattr(wandb, "run", None):
+                wandb.log(payload, step=iteration)   # the TB mirror picks this up
 
 
 __all__ = ["HeldOutLossProbe"]

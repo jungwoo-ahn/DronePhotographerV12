@@ -20,7 +20,7 @@ from src.data.cosmos_camera_dataset import get_camera_pose_sft_dataset
 from src.train.checkpoint_retention import CheckpointRetention
 from src.train.diagnostics import CameraPolicyDiagnostics
 from src.train.goal_dependence import GoalDependenceProbe
-from src.train.heldout_loss import HeldOutLossProbe
+from src.train.heldout_loss import HELDOUT_VAL_ACTION_KEY, HeldOutLossProbe
 from src.train.tb_mirror import TensorBoardMirror
 from cosmos_framework.data.generator.joint_dataloader import (
     PackingDataLoader,
@@ -171,9 +171,30 @@ action_policy_camera_nano = LazyDict(
                 # fixed noise, plus the same on cached train batches so the gap is a
                 # difference of comparable estimators.
                 heldout_loss=L(HeldOutLossProbe)(every_n=500, num_batches=8),
-                # Cosmos never deletes a checkpoint and these are >30 GB each.
+                # Cosmos never deletes a checkpoint and these are 137 GB each, so a 400k run
+                # at save_iter=1000 would write ~55 TB onto a shared filesystem. Kept: the
+                # milestones a long run is judged on, the best by HELD-OUT loss, and enough
+                # recent ones to survive a preemption -- about 1 TB steady state.
+                #
+                # metric_key had been None, and with it keep_best silently degraded to
+                # keep-newest: the held-out probe logs to wandb and retention reads
+                # `output_batch`, so nothing connected them. src/train/metric_bus.py is that
+                # connection, and the key is the one the probe publishes.
+                # keep_every is 10000, not the 100000 this started with. The earlier value
+                # was what the request literally said (100k/200k/300k/400k), and it did what
+                # it said: the first prune removed 12 checkpoints at once and iter_000040000
+                # went with them -- the checkpoint every v5 eval number in this project was
+                # measured on, and the only fallback if the continuation does not pay off.
+                # Losing it cost 2.8 GPU-days to reproduce and it was not reproduced.
+                # Ceiling for a 100k run: 10 milestones + 5 recent + 5 best = 20 x 137 GB
+                # = 2.7 TB. save_iter MUST stay a multiple of HeldOutLossProbe(every_n),
+                # or keep_best scores nothing -- it credits a checkpoint only when the
+                # probe published at that exact iteration.
+                # A checkpoint that is cheap to keep and expensive to recreate should not be
+                # inside the thing that deletes.
                 checkpoint_retention=L(CheckpointRetention)(
-                    keep_last=5, keep_best=3, metric_key=None, min_age_s=900.0,
+                    keep_last=5, keep_best=5, keep_every=10000,
+                    metric_key=HELDOUT_VAL_ACTION_KEY, metric_mode="min", min_age_s=900.0,
                 ),
             ),
         ),
