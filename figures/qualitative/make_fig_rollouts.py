@@ -24,11 +24,11 @@ from make_fig2 import (BLUE, BLUE_D, GREEN, GRID, INK, MUTED, PANEL, Canvas, Pro
                        draw_frustum, load)
 
 POLICIES = [  # key in scores.json, rollout file stem, label, colour, path width
-    ("ours", "ours_v6_45k", "Ours", GREEN, 1.9),
-    ("pi05", "pi05", "π0.5", "#C4553C", 1.0),
-    ("groot", "groot", "GR00T", "#D99A26", 1.0),
-    ("t2a", "t2a_caption_45k", "Text→action", "#8A6BAA", 1.0),
-    ("dp", "dp", "Diffusion policy", "#7C8792", 1.0),
+    ("ours", "ours_v6_45k", "Ours", GREEN, 1.2),
+    ("pi05", "pi05", "π0.5", "#C4553C", 0.7),
+    ("groot", "groot", "GR00T", "#D99A26", 0.7),
+    ("t2a", "t2a_caption_45k", "Text→action", "#8A6BAA", 0.7),
+    ("dp", "dp", "Diffusion policy", "#7C8792", 0.7),
 ]
 EPISODES = [  # key, title, view (azimuth offset from the side-on direction, elevation)
     ("Chill-Camping_150d7263__young-guy-keeps-_ad9f69fc-9bc7-461f-95c3-1026c06b6797:p07:s02:g24",
@@ -43,7 +43,6 @@ EPISODES = [  # key, title, view (azimuth offset from the side-on direction, ele
      "lakeside reeds", (-20, 55)),
 ]
 DEFAULT_ROWS = [0, 1, 2, 4]
-TAIL = 4            # steps of each path the close-up is fitted to
 RH, PW3, FX0, FW, GAP = 1.10, 1.92, 2.04, 0.80, 0.045      # row height, 3-D panel width, frame strip
 W = 7.16
 
@@ -78,7 +77,7 @@ def row(cv, y0, rh, data, title, view, first):
     paths = [pose_pts(data[pk]["ep"]) for pk, *_ in POLICIES]
     ends = np.array([P[-1] for P in paths])
 
-    # ---- close-up 3-D: a camera behind and above the GT goal camera, looking at the subject
+    # ---- 3-D: every path end to end, seen from across the route
     cv.box(0.04, y0, PW3, rh, fc=PANEL, ec="none", r=0.08, z=0.5)
     rect = (0.06, y0 + 0.03, PW3 - 0.04, rh - 0.30)
     clip = Rectangle(rect[:2], rect[2], rect[3], transform=cv.ax.transData)
@@ -91,12 +90,12 @@ def row(cv, y0, rh, data, title, view, first):
     if np.dot(side, (subj - (s0 + gpos) / 2)[:2]) > 0:
         side = -side
     az = np.degrees(np.arctan2(side[1], side[0])) + view[0]
-    # fit every path end to end, the GT camera and the subject
-    fit_pts = np.vstack(paths + [gpos[None], foot[None], (foot + [0, 0, hgt])[None]])
+    # fit every path end to end and the GT camera, tightly; the subject is pointed to if it falls outside
+    fit_pts = np.vstack(paths + [gpos[None]])
     span = max(np.ptp(fit_pts, axis=0).max(), 0.3)
     center = fit_pts.mean(0)
-    pr = Proj(center, az_deg=az, el_deg=view[1], dist=span * 40, fov_deg=3)     # near-orthographic close-up
-    pr.fit(fit_pts, (rect[0] + 0.05, rect[1] + 0.08, rect[2] - 0.10, rect[3] - 0.12), margin=0.14)
+    pr = Proj(center, az_deg=az, el_deg=view[1], dist=span * 40, fov_deg=3)     # near-orthographic
+    pr.fit(fit_pts, (rect[0] + 0.03, rect[1] + 0.05, rect[2] - 0.06, rect[3] - 0.14), margin=0.12)
 
     # ground grid, its spacing picked for the close-up's scale
     step = 0.25 if span < 1.5 else 0.5 if span < 4 else 1.0
@@ -112,7 +111,7 @@ def row(cv, y0, rh, data, title, view, first):
 
     def drop(p, col, z):
         a, b = pr(p)[0], pr(np.r_[p[:2], foot[2]])[0]
-        cv.line([a[0], b[0]], [a[1], b[1]], color=col, lw=0.45, ls=(0, (1.2, 1.2)), z=z, alpha=0.8).set_clip_path(clip)
+        cv.line([a[0], b[0]], [a[1], b[1]], color=col, lw=0.35, ls=(0, (1.2, 1.2)), z=z, alpha=0.7).set_clip_path(clip)
         e = Ellipse(b, 0.045, 0.018, fc=col, ec="none", alpha=0.5, zorder=z)
         cv.ax.add_patch(e)
         e.set_clip_path(clip)
@@ -142,9 +141,7 @@ def row(cv, y0, rh, data, title, view, first):
     p0 = center.copy(); p0[2] = foot[2]
     a0, a1 = pr(p0)[0], pr(p0 + [step * 2, 0, 0])[0]
     sx0 = rect[0] + rect[2] - 0.10 - np.linalg.norm(a1 - a0)
-    sy = rect[1] + rect[3] - 0.05
-    cv.line([sx0, rect[0] + rect[2] - 0.10], [sy] * 2, color=INK, lw=0.8, z=10)
-    cv.text(sx0 - 0.04, sy, f"{step * 2:g} m", size=4.8, ha="right", va="center", z=10)
+    sy = y0 + rh - 0.16                  # beside the row title, clear of the 3-D content
 
     # paths (clipped where they leave the close-up) and end cameras; baselines first so Ours sits on top
     for (pk, _, lab, col, lw), P in reversed(list(zip(POLICIES, paths))):
@@ -153,15 +150,17 @@ def row(cv, y0, rh, data, title, view, first):
         cv.line(q[:, 0], q[:, 1], color=col, lw=lw, z=z, alpha=0.95).set_clip_path(clip)
         drop(P[-1], col, 2.4)
         draw_frustum(cv, pr, data[pk]["ep"]["step_poses"][-1], fs, ec=col, fc="white",
-                     lw=1.0 if pk == "ours" else 0.65, z=z + 0.2)
+                     lw=0.7 if pk == "ours" else 0.45, z=z + 0.2)
     start = ref["step_poses"][0]
-    As, _ = draw_frustum(cv, pr, start, fs, ec=INK, fc="#F1F1F3", lw=0.7, z=8)
+    As, _ = draw_frustum(cv, pr, start, fs, ec=INK, fc="#F1F1F3", lw=0.5, z=8)
     drop(np.asarray(start["position"]), INK, 2.4)
     cv.text(As[0], As[1] + 0.09, "start", size=5.0, z=10, bbox=dict(fc=PANEL, ec="none", pad=0.5, alpha=0.85))
-    Ag, _ = draw_frustum(cv, pr, goal, fs * 1.08, ec=BLUE, fc="none", lw=1.2, z=9)
-    cv.ax.scatter(*Ag, s=34, marker="*", color=BLUE, zorder=10, lw=0.4, edgecolors="white")
+    Ag, _ = draw_frustum(cv, pr, goal, fs * 1.08, ec=BLUE, fc="none", lw=0.9, z=9)
+    cv.ax.scatter(*Ag, s=26, marker="*", color=BLUE, zorder=10, lw=0.3, edgecolors="white")
     for art in cv.ax.lines[n_lines:] + cv.ax.patches[n_patches:] + cv.ax.collections[n_coll:]:
-        art.set_clip_path(clip)                   # everything 3-D stays inside the close-up
+        art.set_clip_path(clip)                   # everything 3-D stays inside the panel
+    cv.line([sx0, rect[0] + rect[2] - 0.10], [sy] * 2, color=INK, lw=0.8, z=10)     # scale bar, unclipped
+    cv.text(sx0 - 0.04, sy, f"{step * 2:g} m", size=4.8, ha="right", va="center", z=10)
     cv.text(Ag[0], Ag[1] - 0.13, "GT", size=5.2, color=BLUE_D, z=10, weight="semibold",
             bbox=dict(fc="white", ec="none", pad=0.5, alpha=0.8))
 
