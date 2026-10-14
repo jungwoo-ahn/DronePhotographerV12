@@ -1,4 +1,4 @@
-"""Fig. 2 — method overview: (a) self-labelling data engine, (b) world action model, (c) deployment.
+"""Fig. 2 — method overview: (a) self-labelling data engine, (b) world camera action model, (c) deployment.
 
 Every number and frame in the figure comes from the repo's data:
   (a) camera flights of placement Chill-Camping__Knit-and-Denim (data.json, 12 pairs x 32 frames);
@@ -515,7 +515,7 @@ def draw_action_tokens(cv, A, x, y, c=0.074, h=0.034):
 
 def panel_b(cv, assets):
     X0, Y0, PW, PH = 3.58, 1.93, 3.54, 2.99
-    cv.panel(X0, Y0, PW, PH, "b", "World action model")
+    cv.panel(X0, Y0, PW, PH, "b", "World camera action model")
     X0 += 0.06
     D, traj = assets["D"], assets["traj"]
     s, g = WINDOWS[-1]
@@ -682,7 +682,8 @@ def panel_c(cv, root):
 
     xw = xp + 1.36
     cv.box(xw, yc - 0.30, 0.60, 0.60, fc=GREEN_L, ec=GREEN, lw=0.8, r=0.07, shadow=True)
-    cv.text(xw + 0.30, yc + 0.09, "world action\nmodel", size=5.9, weight="semibold", color=GREEN_D, linespacing=1.0)
+    cv.text(xw + 0.30, yc + 0.09, "world camera\naction model", size=5.5, weight="semibold", color=GREEN_D,
+            linespacing=1.0)
     cv.text(xw + 0.30, yc - 0.17, "panel (b)", size=4.8, color=MUTED)
     cv.arrow((xp + 1.22, yc), (xw - 0.01, yc), color=BLUE, lw=0.8, ms=4)
 
