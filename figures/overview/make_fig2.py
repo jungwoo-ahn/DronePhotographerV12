@@ -61,7 +61,7 @@ WINDOWS = [(26, 18), (18, 10), (10, 4)]                     # one goal, three wi
 WIN_LAB = [(0.11, 0.07), (0.14, 0.03), (0.17, 0.05)]        # label offsets of w1..w3 in panel (a)
 KEY_C = "Chill-Camping_150d7263__All-People-Are-Sisters_1795d425_p00_s31_g02"   # panel (c) rollout
 OAZ, OEL, ODIST = -10, 48, 30                               # orbit overview of panel (a)
-PINS = [(2, 6, None), (3, 15, None), (6, 27, None), (1, 8, None)]   # (flight, frame, offset or None = outward)
+PINS = [(2, 6, None), (3, 15, None), (1, 8, None)]  # (flight, frame, offset or None = outward)
 OWIN_LAB = [(0.11, 0.06), (0.13, 0.03), (0.15, 0.04)]
 OSTART_DY, OEND_DY = -0.02, -0.34                            # start/end thumbnails, relative to their cameras
 AZ, EL, RV, DIST = 35, 28, 4.5, 18                      # 3-D view of panel (a)
