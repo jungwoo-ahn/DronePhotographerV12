@@ -45,6 +45,8 @@ FUNNEL = [("9,889", "scene × subject\nruns"), ("7,885", "placements\n(91 scenes
 def args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="/home/nas_main/jungwooahn/projects/DronePhotographerV12")
+    ap.add_argument("--b", default="schematic", choices=["schematic", "real"],
+                    help="panel (b): schematic grid, or the real re-run grid projected into the scene camera")
     return ap.parse_args()
 
 
@@ -230,44 +232,129 @@ def panel_placement(cv, root):
             va="top", weight="semibold")
 
 
+GRID_RUN = "runs/placement_grid/Chill-Camping__Knit-and-Denim"   # sbatch_placement_grid.sh output
+VIEW_SCORES = [3, 2, 1, 8, 4]   # the placement run's VLM view scores for this spot (data/vlm_object_placing_v6_*)
+
+
+def panel_placement_real(cv, root):
+    """Panel (b) from a real re-run of the floor search, projected into the scene camera's own view."""
+    X0, Y0, PW, PH = 2.46, 2.42, 2.30, 2.44
+    cv.panel(X0, Y0, PW, PH, "b", "VLM-guided placement")
+    G = root / GRID_RUN
+    r = json.load(open(G / "cells.json"))
+    im = Image.open(G / "scene_cam.png").convert("RGB")
+    Wi, Hi = im.size
+    Mi = np.linalg.inv(np.array(r["scene_cam_matrix"]))
+    k = r["scene_cam_lens"] / r["scene_cam_sensor"]
+
+    def proj(p):
+        q = Mi @ np.r_[p, 1.0]
+        if q[2] >= -0.1:
+            return None
+        u, v = Wi / 2 + k * q[0] / -q[2] * Wi, Hi / 2 - k * q[1] / -q[2] * Wi
+        return (u, v) if 0 <= u < Wi and 0 <= v < Hi else None
+
+    w = 1.90
+    h = w * Hi / Wi
+    x, y = X0 + 0.10, Y0 + PH - 0.34 - h
+    cv.image(im, x, y, w, h, shadow=True)
+    clip = Rectangle((x, y), w, h, transform=cv.ax.transData)
+    sc = [c for c in r["cells"] if c["status"] == "scored"]
+    s = np.array([c["score"] for c in sc])
+    lo, hi = np.percentile(s, [5, 95])
+    for c, v in zip(sc, s):
+        q = proj((c["x"], c["y"], c["z"]))
+        if q is None:
+            continue
+        t = float(np.clip((v - lo) / (hi - lo + 1e-9), 0, 1))
+        cv.ax.scatter([x + q[0] / Wi * w], [y + h - q[1] / Hi * h], s=1.6 + 3.5 * t,
+                      color=(0.55 - 0.45 * t, 0.85 - 0.25 * t, 0.55 - 0.35 * t), zorder=5, lw=0).set_clip_path(clip)
+    for i, t in enumerate(r["top_k"]):
+        q = proj(t["position"])
+        if q is not None:
+            cv.ax.add_patch(Circle((x + q[0] / Wi * w, y + h - q[1] / Hi * h), 0.035, fc="none", ec="white", lw=1.0,
+                                   zorder=6))
+    badge(cv, x + 0.07, y + h - 0.07, 2)
+    n = {}
+    for c in r["cells"]:
+        n[c["status"]] = n.get(c["status"], 0) + 1
+    cv.text(x + w - 0.04, y + h - 0.05, "ray-cast floor cells,\nseen from the scene camera", size=4.5,
+            color="white", ha="right", va="top", linespacing=1.1)
+    cv.text(x, y - 0.05, f"{n.get('scored', 0):,} flat & visible (green, darker = higher score); dropped: "
+            f"{n.get('out_of_view', 0) / 1000:.1f}k outside the view,\n{n.get('not_visible', 0):,} hidden, "
+            f"{n.get('not_flat', 0) + n.get('uneven', 0):,} not flat · rings: top-3 kept (re-run without the VLM region)",
+            size=4.2, ha="left", va="top", color=MUTED, linespacing=1.2)
+
+    # 3: VLM judge with the real per-view scores of the accepted spot
+    T = traj_dir(root) / KEY
+    dj = json.load(open(T / "data.json"))
+    vw = 0.40
+    vh = vw * 0.75
+    vy = Y0 + 0.10
+    for i, (p, f) in enumerate([(4, 4), (9, 20), (1, 12)]):
+        cv.image(load(T / dj["render_records"][p][f]["path_rel"], 300), X0 + 0.10 + i * (vw + 0.035), vy, vw, vh,
+                 shadow=True)
+    badge(cv, X0 + 0.16, vy + vh - 0.06, 3, GREEN)
+    jx = X0 + 0.10 + 3 * (vw + 0.035)
+    jw = X0 + PW - 0.10 - jx
+    cv.box(jx, vy, jw, vh, fc="white", ec=GREEN, lw=0.7, r=0.04, shadow=True)
+    cv.text(jx + jw / 2, vy + vh - 0.06, "VLM judge", size=4.9, weight="semibold", color=GREEN_D)
+    cw = (jw - 0.08) / len(VIEW_SCORES)
+    for i, v in enumerate(VIEW_SCORES):
+        ok = v >= 7
+        cx = jx + 0.04 + (i + 0.5) * cw
+        cv.ax.add_patch(Rectangle((cx - cw * 0.42, vy + 0.10), cw * 0.84, 0.09, fc=GREEN if ok else "#E6E8EC",
+                                  ec="none", zorder=6))
+        cv.text(cx, vy + 0.145, str(v), size=4.6, color="white" if ok else INK, z=7, weight="bold" if ok else "normal")
+    cv.text(jx + jw / 2, vy + 0.05, "best 8 ≥ 7 → keep", size=4.2, color=GREEN_D)
+
+
 def panel_trajectory(cv, root):
     X0, Y0, PW, PH = 4.82, 2.42, 2.30, 2.44
     cv.panel(X0, Y0, PW, PH, "c", "Camera trajectories")
     dj = json.load(open(traj_dir(root) / KEY / "data.json"))
     el = dj["accepted_pairs"][PAIR_E]["ellipse"]
     a, b, thn = float(el["a"]), float(el["b"]), np.radians(float(el["theta_near_deg"]))
-    # the ellipse in its own plane (u right, v up), O at the left, C_far at the right
-    ox, oy = X0 + 0.24, Y0 + 1.46
-    s = 1.55 / a
-    clip = Rectangle((X0 + 0.04, Y0 + 1.30), PW - 0.08, 0.86, transform=cv.ax.transData)
+    # the whole ellipse in its own plane: centre O, major axis along O -> C_far (u), minor axis v
+    ox, oy = X0 + 1.02, Y0 + 1.50
+    s = 0.86 / a
+    t = np.linspace(0, 2 * np.pi, 240)
 
     def P(th):
         r = a * b / np.sqrt((b * np.cos(th)) ** 2 + (a * np.sin(th)) ** 2)
         return ox + s * r * np.cos(th), oy + s * r * np.sin(th)
 
-    ex, ey = P(np.linspace(-0.6, 0.9, 200))
-    cv.line(ex, ey, color=FAINT, lw=0.5, ls=(0, (2, 2)), z=2).set_clip_path(clip)
+    ex, ey = P(t)
+    cv.line(ex, ey, color="#B9BEC6", lw=0.6, ls=(0, (2.2, 1.8)), z=2)
+    # semi-axes
+    cv.line([ox, ox + s * a], [oy, oy], color=MUTED, lw=0.5, z=2.5)
+    cv.line([ox, ox], [oy, oy + s * b], color=MUTED, lw=0.5, z=2.5)
+    cv.text(ox + s * a * 0.45, oy - 0.05, r"$a=\|C_{far}-O\|$", size=5.2, color=MUTED, va="top")
+    cv.text(ox - 0.03, oy + s * b * 0.5, r"$b$", size=5.6, color=MUTED, ha="right")
+    # sampled arc C_far (theta = 0) -> C_near, 32 frames at equal delta-theta
     tt = np.linspace(0, thn, 32)
     px, py = P(tt)
-    for k in range(0, 32, 3):
+    for k in range(0, 32, 4):
         cv.line([ox, px[k]], [oy, py[k]], color=GRID, lw=0.4, z=1.5)
-    cv.line(px, py, color=INK, lw=0.9, z=4)
+    cv.line(px, py, color=INK, lw=1.1, z=4)
     cv.ax.scatter(px, py, s=3.5, color=INK, zorder=4.5, lw=0)
     for k in (0, 31):
         d = np.array([ox - px[k], oy - py[k]])
         d /= np.linalg.norm(d)
         nrm = np.array([-d[1], d[0]])
         tip = np.array([px[k], py[k]])
-        cv.ax.add_patch(Polygon([tip, tip - d * 0.09 + nrm * 0.045, tip - d * 0.09 - nrm * 0.045], closed=True,
+        cv.ax.add_patch(Polygon([tip, tip - d * 0.085 + nrm * 0.042, tip - d * 0.085 - nrm * 0.042], closed=True,
                                 fc="white", ec=INK, lw=0.7, zorder=5))
-    cv.text(px[0] - 0.02, py[0] - 0.10, r"$C_{far}$ (frame 0)", size=5.6, ha="right", va="top")
-    cv.text(px[31] - 0.08, py[31] + 0.02, r"$C_{near}$ (31)", size=5.6, ha="right", va="center")
-    cv.ax.add_patch(Circle((ox, oy), 0.032, fc=BLUE, ec="none", zorder=6))
-    cv.text(ox + 0.02, oy - 0.07, "O: look-at at 0.75 × height", size=4.7, color=BLUE_D, ha="left", va="top")
-    cv.text(ox + 0.62, oy + 0.07, r"equal $\Delta\theta$", size=4.8, color=MUTED, ha="left")
-    cv.text(X0 + 0.10, Y0 + 1.22, "endpoints: azimuth ~ U[0°, 360°), distance ~ logU[0.8, 8] m,\n"
-            "height −0.1 … 2.5 m; ellipse about O through both, 32 frames", size=4.6, ha="left", va="top",
-            linespacing=1.2)
+    cv.text(px[0] + 0.03, py[0] - 0.07, r"$C_{far}$ = vertex" "\n(frame 0)", size=5.0, ha="center", va="top",
+            linespacing=1.1)
+    cv.text(px[31] + 0.10, py[31] + 0.05, r"$C_{near}$ (frame 31)", size=5.0, ha="left", va="bottom")
+    cv.text(ox + s * a * 0.70, oy + s * b * 0.40, r"$\Delta\theta$ equal", size=4.6, color=MUTED)
+    cv.ax.add_patch(Circle((ox, oy), 0.030, fc=BLUE, ec="none", zorder=6))
+    cv.text(ox - 0.04, oy - 0.05, "O = centre\n(look-at, 0.75 × height)", size=4.6, color=BLUE_D, ha="right",
+            va="top", linespacing=1.1)
+    cv.text(X0 + 0.10, Y0 + PH - 0.34, "ellipse centred at O with C_far as its vertex; b is solved so it passes\n"
+            "through C_near. Endpoints: azimuth ~ U[0°, 360°), distance ~ logU[0.8, 8] m.", size=4.6, ha="left",
+            va="top", linespacing=1.2)
     # rejection bars
     by = Y0 + 0.86
     cv.text(X0 + 0.10, by, "rejected (of 393k pairs)", size=5.0, ha="left", va="center", weight="semibold")
@@ -377,20 +464,22 @@ def funnel(cv):
 
 
 def main():
-    root = Path(args().root)
+    a = args()
+    root = Path(a.root)
     cv = Canvas()
     cv.fig.set_size_inches(W, H)
     cv.ax.set_xlim(0, W)
     cv.ax.set_ylim(0, H)
     panel_assets(cv, root)
-    panel_placement(cv, root)
+    (panel_placement_real if a.b == "real" else panel_placement)(cv, root)
     panel_trajectory(cv, root)
     panel_render(cv, root)
     panel_windows(cv, root)
     funnel(cv)
+    stem = "fig_datagen" + ("_realgrid" if a.b == "real" else "")
     for ext in ("pdf", "svg", "png"):
-        cv.fig.savefig(HERE / f"fig_datagen.{ext}", dpi=300 if ext == "png" else None)
-    print("wrote", HERE / "fig_datagen.png")
+        cv.fig.savefig(HERE / f"{stem}.{ext}", dpi=300 if ext == "png" else None)
+    print("wrote", HERE / f"{stem}.png")
 
 
 if __name__ == "__main__":
