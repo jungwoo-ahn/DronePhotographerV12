@@ -41,8 +41,14 @@ EPISODES = [  # key, title, view (azimuth offset from the side-on direction, ele
      "office atrium", (-20, 55)),
     ("Chill-Camping_150d7263__Hahaha-woman-on-chair_50c9329e:p05:s10:g25",
      "lakeside reeds", (-20, 55)),
+    ("Chill-Camping_150d7263__Modern-Thinker_ae3a6545:p05:s05:g19",
+     "lake shore", (-20, 55)),
+    ("Modern-Office-Full-set-01_d2deb1e1__Party-goer-man-in-plaid-shirt-and-shorts_c273aa2e:p00:s20:g06",
+     "modern office", (-20, 55)),
+    ("Nature-Snowy-Mountain-Village-Retreat_f884ef3e__Knit-and-Denim_82dd220b:p07:s02:g21",
+     "mountain terrace", (-20, 55)),
 ]
-DEFAULT_ROWS = [0, 1, 2, 4]
+DEFAULT_ROWS = [0, 1, 2, 4, 3, 5, 6, 7]
 RH, PW3, FX0, FW, GAP = 1.10, 1.92, 2.04, 0.80, 0.045      # row height, 3-D panel width, frame strip
 W = 7.16
 
