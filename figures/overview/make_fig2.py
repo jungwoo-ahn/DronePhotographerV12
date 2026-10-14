@@ -60,7 +60,11 @@ PAIR, S_IDX, G_IDX = 4, 26, 4
 WINDOWS = [(26, 18), (18, 10), (10, 4)]                     # one goal, three windows
 WIN_LAB = [(0.11, 0.07), (0.14, 0.03), (0.17, 0.05)]        # label offsets of w1..w3 in panel (a)
 KEY_C = "Chill-Camping_150d7263__All-People-Are-Sisters_1795d425_p00_s31_g02"   # panel (c) rollout
-AZ, EL, RV, DIST = 35, 28, 4.5, 18                        # 3-D view of panel (a)
+OAZ, OEL, ODIST = -10, 48, 30                               # orbit overview of panel (a)
+PINS = [(2, 6, None), (3, 15, None), (6, 27, None), (1, 8, None)]   # (flight, frame, offset or None = outward)
+OWIN_LAB = [(0.11, 0.06), (0.13, 0.03), (0.15, 0.04)]
+OLAB_S, OLAB_G, OSHOOT = (0.0, 0.18), (-0.18, -0.06), (0.10, -0.14)
+AZ, EL, RV, DIST = 35, 28, 4.5, 18                      # 3-D view of panel (a)
 
 
 def args():
@@ -68,6 +72,9 @@ def args():
     ap.add_argument("--root", default="/home/nas_main/jungwooahn/projects/DronePhotographerV12")
     ap.add_argument("--view", default=None, help="az,el,radius,dist to try another 3-D view of panel (a)")
     ap.add_argument("--out", default="fig2_overview")
+    ap.add_argument("--a-style", default="orbits", choices=["orbits", "behind"],
+                    help="panel (a): all orbits from above, or the view from behind the cameras")
+    ap.add_argument("--orbit-view", default=None, help="az,el,dist for the orbit overview")
     return ap.parse_args()
 
 
@@ -244,7 +251,121 @@ def draw_frustum(cv, pr, pose, size, ec, fc, lw=0.5, z=5, img=None):
     return A, C
 
 
-def panel_a(cv, root):
+def panel_a_orbits(cv, root):
+    """Overview: all 12 orbits around the subject, one walk highlighted, real frames pinned to other flights."""
+    X0, Y0, PW, PH = 0.04, 1.93, 3.46, 2.99
+    cv.panel(X0, Y0, PW, PH, "a", "Self-labelling data engine")
+    D = root / "data/trajectories/v7_stage2_renders_lookat075" / KEY
+    d = json.load(open(D / "data.json"))
+    foot = np.array(d["subject_foot"]); hgt = d["subject_height"]
+    pairs = d["accepted_pairs"]
+    T = [np.array([f["pos"] for f in p["trajectory_32f"]]) for p in pairs]
+    traj = pairs[PAIR]["trajectory_32f"]
+    im_g = load(D / f"renders/pair_{PAIR:02d}_frame_{G_IDX:02d}.jpg", 700)
+
+    rect = (X0 + 0.04, Y0 + 0.92, PW - 0.08, PH - 1.20)
+    pr = Proj(foot + [0, 0, 0.6], az_deg=OAZ, el_deg=OEL, dist=ODIST, fov_deg=30)
+    pr.fit(np.vstack(T + [foot + [0, 0, hgt]]), rect, margin=0.16)
+    R = np.hypot(*(np.vstack(T)[:, :2] - foot[:2]).T).max() + 0.4
+    t96 = np.linspace(0, 2 * np.pi, 96)
+
+    # ground: soft disc, 2 m grid, range rings
+    for rr, a in ((R, 0.55), (R * 0.66, 0.6), (R * 0.33, 0.7)):
+        g = pr(np.c_[foot[0] + rr * np.cos(t96), foot[1] + rr * np.sin(t96), np.zeros_like(t96)])
+        cv.ax.add_patch(Polygon(g, closed=True, fc="white", ec="none", alpha=a, zorder=0.8))
+    for v in np.arange(-np.floor(R / 2) * 2, R, 2.0):
+        for a_, b_ in (((v, -R), (v, R)), ((-R, v), (R, v))):
+            seg = np.linspace(a_, b_, 120)
+            m = np.hypot(seg[:, 0], seg[:, 1]) <= R
+            if m.sum() > 1:
+                q = pr(np.c_[seg[m] + foot[:2], np.zeros(m.sum())])
+                cv.line(q[:, 0], q[:, 1], color=GRID, lw=0.35, z=1)
+
+    # every flight: ground shadow + path; endpoints as dots
+    for i, P in enumerate(T):
+        sh_ = pr(np.c_[P[:, :2], np.zeros(len(P))])
+        cv.line(sh_[:, 0], sh_[:, 1], color="#CBD0D7", lw=1.1, z=1.2, alpha=0.55)
+        if i == PAIR:
+            continue
+        q = pr(P)
+        cv.line(q[:, 0], q[:, 1], color="#9AA0AA", lw=0.65, z=2)
+        cv.ax.scatter(*q[[0, -1]].T, s=2.5, color="#9AA0AA", zorder=2.1, lw=0)
+
+    # subject
+    sh = pr(np.c_[foot[0] + 0.45 * np.cos(t96), foot[1] + 0.45 * np.sin(t96), np.zeros_like(t96)])
+    cv.ax.add_patch(Polygon(sh, closed=True, fc="#CDD1D8", ec="none", zorder=3))
+    cv.person(pr(foot)[0], pr(foot + [0, 0, hgt * 1.6])[0], z=7)     # glyph drawn 1.6x for legibility
+    hd = pr(foot + [0, 0, hgt * 1.6])[0]
+    cv.text(hd[0], hd[1] + 0.08, "subject", size=5.6, color=MUTED)
+
+    # real frames from other flights, pinned to their cameras
+    sub2 = pr(foot + [0, 0, hgt / 2])[0]
+    for p, f, off in PINS:
+        cam = pr(T[p][f])[0]
+        draw_frustum(cv, pr, pairs[p]["trajectory_32f"][f], 0.45, ec=INK, fc="white", lw=0.5, z=5)
+        tw, th_ = 0.40, 0.30
+        if off is None:
+            u_ = (cam - sub2) / (np.linalg.norm(cam - sub2) + 1e-9)
+            off = 0.32 * u_
+        cxy = cam + np.array(off)
+        cxy[1] = min(cxy[1], rect[1] + rect[3] - th_ / 2 - 0.02)          # keep clear of the panel title
+        cxy[0] = np.clip(cxy[0], rect[0] + tw / 2 + 0.04, rect[0] + rect[2] - tw / 2 - 0.04)
+        cv.line([cam[0], cxy[0]], [cam[1], cxy[1]], color=INK, lw=0.4, ls=(0, (1, 1.2)), z=4)
+        cv.image(load(D / f"renders/pair_{p:02d}_frame_{f:02d}.jpg", 300), cxy[0] - tw / 2, cxy[1] - th_ / 2,
+                 tw, th_, ec="white", lw=1.0, z=9, shadow=True)
+
+    # the highlighted walk: one goal, three windows
+    P = T[PAIR]
+    q = pr(P)
+    cv.line(q[:, 0], q[:, 1], color=INK, lw=0.8, z=5)
+    for w, (s, e) in enumerate(WINDOWS):
+        qw = pr(P[e:s + 1][::-1])
+        cv.line(qw[:-1, 0], qw[:-1, 1], color=WIN[w], lw=2.4, z=6 + w * 0.1)
+        cv.arrow(qw[-2], qw[-1], color=WIN[w], lw=2.4, ms=5.5, z=6 + w * 0.1)
+        m = qw[len(qw) // 2] + np.array(OWIN_LAB[w])
+        cv.text(*m, f"$w_{w + 1}$", size=7, color="#3E9A70" if w == 0 else WIN[w], z=10)
+    look = pr(np.array(d["subject_center"]))[0]
+    As, Cs = draw_frustum(cv, pr, traj[S_IDX], 0.55, ec=INK, fc="#F1F1F3", lw=0.8, z=8)
+    Ag, Cg = draw_frustum(cv, pr, traj[G_IDX], 0.55, ec=BLUE, fc=BLUE_L, lw=1.0, z=8.5)
+    cv.line([Ag[0], look[0]], [Ag[1], look[1]], color=BLUE, lw=0.6, ls=(0, (2, 2)), z=4)
+    cv.text(As[0] + OLAB_S[0], As[1] + OLAB_S[1], r"$o_{26}$", size=7.5, z=10)
+    cv.text(Ag[0] + OLAB_G[0], Ag[1] + OLAB_G[1], r"$o_g$", size=7.5, color=BLUE_D, z=10)
+    sx_, sy_ = Ag[0] + OSHOOT[0], Ag[1] + OSHOOT[1]
+    cv.shutter(sx_, sy_, r=0.035)
+    cv.text(sx_ + 0.055, sy_, "shoot", size=5.4, ha="left", z=10)
+
+    # bottom row: goal close-up with the projected subject box -> hindsight label -> the training pair
+    TX, TW = X0 + 0.14, 0.76
+    th = TW * 0.75
+    yg = Y0 + 0.14
+    cv.image(im_g, TX, yg, TW, th, ec=BLUE, lw=1.0, shadow=True)
+    cv.text(TX, yg + th + 0.04, r"goal $o_g$", size=5.8, ha="left", va="bottom", color=BLUE_D, weight="semibold")
+    bx = d["render_records"][PAIR][G_IDX]["bbox_xyxy_full"]
+    sx, sy = TW / 1024, th / 768
+    x0b, x1b = TX + bx[0] * sx, TX + min(bx[2], 1022) * sx
+    y0b, y1b = yg + th - bx[3] * sy, yg + th - bx[1] * sy
+    cv.ax.add_patch(Rectangle((x0b, y0b), x1b - x0b, y1b - y0b, fc="none", ec=BLUE, lw=0.8,
+                              ls=(0, (2.5, 1.5)), zorder=6))
+    cv.ax.scatter([(x0b + x1b) / 2], [(y0b + y1b) / 2], s=6, marker="+", color=BLUE, lw=0.8, zorder=6)
+    cv.line([Cg[:, 0].min(), TX + TW - 0.02], [Cg[:, 1].min(), yg + th + 0.01], color=BLUE, lw=0.45,
+            ls=(0, (1, 1.5)), z=3)
+    LX, LW = TX + TW + 0.14, 0.86
+    cv.box(LX, yg, LW, th, fc="white", ec=BLUE, lw=0.8, r=0.05, shadow=True)
+    cv.text(LX + 0.06, yg + th - 0.09, r"label $p(o_g)$", size=5.8, color=BLUE_D, ha="left", weight="semibold")
+    cv.text(LX + 0.06, yg + th / 2 - 0.08, "bearing   222°\nelevation  −1°\noccupancy  18%\ncentre  895,351",
+            size=4.7, color=INK, ha="left", family="IBM Plex Mono", linespacing=1.28)
+    cv.arrow((TX + TW + 0.02, yg + th / 2), (LX - 0.01, yg + th / 2), color=BLUE, lw=0.7, ms=3.2)
+    QX = LX + LW + 0.12
+    cv.text(QX, yg + th - 0.02, "read off the projected mesh:\nno reward, no human label", size=5.0, color=MUTED,
+            ha="left", va="top", linespacing=1.2)
+    cv.text(QX, yg + 0.23, r"$(o_s, p(o_g))\mapsto(a_{s:s+8}, o_{s+1:s+8})$", size=6.0, ha="left",
+            va="bottom")
+    cv.text(QX, yg, "12 orbits × 32 frames / placement\n91 scenes × 102 subjects → 150k", size=4.9,
+            color=MUTED, ha="left", va="bottom", linespacing=1.2)
+    return dict(D=D, traj=traj)
+
+
+def panel_a_behind(cv, root):
     X0, Y0, PW, PH = 0.04, 1.93, 3.46, 2.99
     cv.panel(X0, Y0, PW, PH, "a", "Self-labelling data engine")
     D = root / "data/trajectories/v7_stage2_renders_lookat075" / KEY
@@ -606,16 +727,18 @@ def panel_c(cv, root):
 
 
 def main():
-    global AZ, EL, RV, DIST
+    global AZ, EL, RV, DIST, OAZ, OEL, ODIST
     a = args()
     root = Path(a.root)
     if a.view:
         AZ, EL, RV, DIST = map(float, a.view.split(","))
+    if a.orbit_view:
+        OAZ, OEL, ODIST = map(float, a.orbit_view.split(","))
     cv = Canvas()
-    assets = panel_a(cv, root)
+    assets = (panel_a_orbits if a.a_style == "orbits" else panel_a_behind)(cv, root)
     panel_b(cv, assets)
     panel_c(cv, root)
-    for ext in (("png",) if a.view else ("pdf", "svg", "png")):
+    for ext in (("png",) if (a.view or a.orbit_view) else ("pdf", "svg", "png")):
         cv.fig.savefig(HERE / f"{a.out}.{ext}", dpi=300 if ext == "png" else None)
     print("wrote", HERE / f"{a.out}.png")
 
