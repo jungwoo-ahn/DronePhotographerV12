@@ -229,7 +229,7 @@ class Proj:
 
 
 def frustum(pose, size):
-    p = np.asarray(pose["pos"])
+    p = np.asarray(pose["pos"] if "pos" in pose else pose["position"])   # trajectory data / rollout logs
     f = np.asarray(pose["forward"]); f /= np.linalg.norm(f)
     u = np.asarray(pose["up"]); u /= np.linalg.norm(u)
     r = np.cross(f, u)
