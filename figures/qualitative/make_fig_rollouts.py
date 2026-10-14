@@ -30,17 +30,17 @@ POLICIES = [  # key in scores.json, rollout file stem, label, colour, path width
     ("t2a", "t2a_caption_45k", "Text→action", "#8A6BAA", 1.0),
     ("dp", "dp", "Diffusion policy", "#7C8792", 1.0),
 ]
-EPISODES = [  # key, title, view (azimuth offset from the subject->goal direction, elevation)
+EPISODES = [  # key, title, view (azimuth offset from the side-on direction, elevation)
     ("Chill-Camping_150d7263__young-guy-keeps-_ad9f69fc-9bc7-461f-95c3-1026c06b6797:p07:s02:g24",
-     "lakeside camp", (35, 32)),
+     "lakeside camp", (-20, 55)),
     ("Nature-Snowy-Mountain-Village-Retreat_f884ef3e__Guy-in-yellow-jacket_660f924e:p08:s17:g01",
-     "snowy village", (35, 32)),
+     "snowy village", (-20, 55)),
     ("Desert-Roadside-Repair-Garage_a1a2b2ac__young-guy-keeps-_ad9f69fc-9bc7-461f-95c3-1026c06b6797:p07:s29:g13",
-     "desert roadside", (35, 32)),
+     "desert roadside", (-20, 55)),
     ("office-buildingwarehouse-creative-headquarters__Young-Tall-Guy-Talking-by-Phone_7e126859:p07:s15:g02",
-     "office atrium", (35, 32)),
+     "office atrium", (-20, 55)),
     ("Chill-Camping_150d7263__Hahaha-woman-on-chair_50c9329e:p05:s10:g25",
-     "lakeside reeds", (35, 32)),
+     "lakeside reeds", (-20, 55)),
 ]
 DEFAULT_ROWS = [0, 1, 2, 4]
 TAIL = 4            # steps of each path the close-up is fitted to
@@ -83,13 +83,16 @@ def row(cv, y0, rh, data, title, view, first):
     rect = (0.06, y0 + 0.03, PW3 - 0.04, rh - 0.30)
     clip = Rectangle(rect[:2], rect[2], rect[3], transform=cv.ax.transData)
     n_lines, n_patches, n_coll = len(cv.ax.lines), len(cv.ax.patches), len(cv.ax.collections)
-    out_dir = (gpos - subj)[:2]
-    az = np.degrees(np.arctan2(out_dir[1], out_dir[0])) + view[0]
-    # fit the goal neighbourhood: GT and the three end cameras nearest to it; farther misses run off the panel
-    dist = np.linalg.norm(ends - gpos, axis=1)
-    near = np.argsort(dist)[:3]
-    tails = np.vstack([paths[i][-TAIL:] for i in near])
-    fit_pts = np.vstack([tails, gpos[None]])
+    # look across the paths: perpendicular to start->goal, from the side away from the subject,
+    # so the whole route spans the panel's width instead of running into the screen
+    s0 = np.asarray(ref["step_poses"][0]["position"])
+    run = (gpos - s0)[:2]
+    side = np.array([-run[1], run[0]])
+    if np.dot(side, (subj - (s0 + gpos) / 2)[:2]) > 0:
+        side = -side
+    az = np.degrees(np.arctan2(side[1], side[0])) + view[0]
+    # fit every path end to end, the GT camera and the subject
+    fit_pts = np.vstack(paths + [gpos[None], foot[None], (foot + [0, 0, hgt])[None]])
     span = max(np.ptp(fit_pts, axis=0).max(), 0.3)
     center = fit_pts.mean(0)
     pr = Proj(center, az_deg=az, el_deg=view[1], dist=span * 40, fov_deg=3)     # near-orthographic close-up
@@ -105,7 +108,7 @@ def row(cv, y0, rh, data, title, view, first):
         q = pr(np.c_[[lo[0], hi[0]], [v, v], [foot[2]] * 2])
         cv.line(q[:, 0], q[:, 1], color=GRID, lw=0.35, z=1).set_clip_path(clip)
 
-    fs = float(np.clip(span * 0.13, 0.05, 0.45))   # frustum size (m), scaled to what the close-up shows
+    fs = float(np.clip(span * 0.075, 0.08, 0.5))   # frustum size (m), scaled to what the view shows
 
     def drop(p, col, z):
         a, b = pr(p)[0], pr(np.r_[p[:2], foot[2]])[0]
@@ -126,7 +129,7 @@ def row(cv, y0, rh, data, title, view, first):
         cv.person(pr(foot)[0], pr(foot + [0, 0, hgt])[0], z=6)
     elif inside:
         cv.ax.scatter(*sq, s=10, color=BLUE_D, zorder=10, lw=0)
-        cv.text(sq[0] + 0.05, sq[1], "subject", size=5.0, color=BLUE_D, z=10, ha="left",
+        cv.text(sq[0], sq[1] + 0.10, "subject", size=5.0, color=BLUE_D, z=10,
                 bbox=dict(fc=PANEL, ec="none", pad=0.6, alpha=0.9))
     else:
         ts = [((rect[0] + 0.14 if u[0] < 0 else rect[0] + rect[2] - 0.14) - gq[0]) / u[0] if abs(u[0]) > 1e-6 else 1e9,
@@ -151,16 +154,19 @@ def row(cv, y0, rh, data, title, view, first):
         drop(P[-1], col, 2.4)
         draw_frustum(cv, pr, data[pk]["ep"]["step_poses"][-1], fs, ec=col, fc="white",
                      lw=1.0 if pk == "ours" else 0.65, z=z + 0.2)
+    start = ref["step_poses"][0]
+    As, _ = draw_frustum(cv, pr, start, fs, ec=INK, fc="#F1F1F3", lw=0.7, z=8)
+    drop(np.asarray(start["position"]), INK, 2.4)
+    cv.text(As[0], As[1] + 0.09, "start", size=5.0, z=10, bbox=dict(fc=PANEL, ec="none", pad=0.5, alpha=0.85))
     Ag, _ = draw_frustum(cv, pr, goal, fs * 1.08, ec=BLUE, fc="none", lw=1.2, z=9)
     cv.ax.scatter(*Ag, s=34, marker="*", color=BLUE, zorder=10, lw=0.4, edgecolors="white")
     for art in cv.ax.lines[n_lines:] + cv.ax.patches[n_patches:] + cv.ax.collections[n_coll:]:
         art.set_clip_path(clip)                   # everything 3-D stays inside the close-up
-    cv.text(Ag[0] - 0.10, Ag[1] - 0.04, "GT", size=5.2, color=BLUE_D, z=10, weight="semibold", ha="right",
+    cv.text(Ag[0], Ag[1] - 0.13, "GT", size=5.2, color=BLUE_D, z=10, weight="semibold",
             bbox=dict(fc="white", ec="none", pad=0.5, alpha=0.8))
 
     cv.text(0.12, y0 + rh - 0.10, title, size=6.0, weight="semibold", ha="left", z=10)
-    cv.text(0.12, y0 + rh - 0.21, f"start d = {ref['d_start']:.2f} · close-up at the goal", size=5.0, color=MUTED,
-            ha="left", z=10)
+    cv.text(0.12, y0 + rh - 0.21, f"start d = {ref['d_start']:.2f}", size=5.0, color=MUTED, ha="left", z=10)
 
     # ---- last frames: GT goal, then each policy
     fh = FW * 0.75
