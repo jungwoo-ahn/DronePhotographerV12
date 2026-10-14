@@ -63,7 +63,7 @@ KEY_C = "Chill-Camping_150d7263__All-People-Are-Sisters_1795d425_p00_s31_g02"   
 OAZ, OEL, ODIST = -10, 48, 30                               # orbit overview of panel (a)
 PINS = [(2, 6, None), (3, 15, None), (6, 27, None), (1, 8, None)]   # (flight, frame, offset or None = outward)
 OWIN_LAB = [(0.11, 0.06), (0.13, 0.03), (0.15, 0.04)]
-OLAB_S, OLAB_G, OSHOOT = (0.0, 0.18), (-0.18, -0.06), (0.10, -0.14)
+OSTART_DY, OEND_DY = -0.02, -0.34                            # start/end thumbnails, relative to their cameras
 AZ, EL, RV, DIST = 35, 28, 4.5, 18                      # 3-D view of panel (a)
 
 
@@ -320,48 +320,52 @@ def panel_a_orbits(cv, root):
     cv.line(q[:, 0], q[:, 1], color=INK, lw=0.8, z=5)
     for w, (s, e) in enumerate(WINDOWS):
         qw = pr(P[e:s + 1][::-1])
-        cv.line(qw[:-1, 0], qw[:-1, 1], color=WIN[w], lw=2.4, z=6 + w * 0.1)
-        cv.arrow(qw[-2], qw[-1], color=WIN[w], lw=2.4, ms=5.5, z=6 + w * 0.1)
+        cv.line(qw[:-1, 0], qw[:-1, 1], color=WIN[w], lw=1.3, z=6 + w * 0.1)
+        cv.arrow(qw[-2], qw[-1], color=WIN[w], lw=1.3, ms=3.6, z=6 + w * 0.1)
         m = qw[len(qw) // 2] + np.array(OWIN_LAB[w])
-        cv.text(*m, f"$w_{w + 1}$", size=7, color="#3E9A70" if w == 0 else WIN[w], z=10)
+        cv.text(*m, f"$w_{w + 1}$", size=6.5, color="#3E9A70" if w == 0 else WIN[w], z=10)
     look = pr(np.array(d["subject_center"]))[0]
     As, Cs = draw_frustum(cv, pr, traj[S_IDX], 0.55, ec=INK, fc="#F1F1F3", lw=0.8, z=8)
     Ag, Cg = draw_frustum(cv, pr, traj[G_IDX], 0.55, ec=BLUE, fc=BLUE_L, lw=1.0, z=8.5)
     cv.line([Ag[0], look[0]], [Ag[1], look[1]], color=BLUE, lw=0.6, ls=(0, (2, 2)), z=4)
-    cv.text(As[0] + OLAB_S[0], As[1] + OLAB_S[1], r"$o_{26}$", size=7.5, z=10)
-    cv.text(Ag[0] + OLAB_G[0], Ag[1] + OLAB_G[1], r"$o_g$", size=7.5, color=BLUE_D, z=10)
-    sx_, sy_ = Ag[0] + OSHOOT[0], Ag[1] + OSHOOT[1]
-    cv.shutter(sx_, sy_, r=0.035)
-    cv.text(sx_ + 0.055, sy_, "shoot", size=5.4, ha="left", z=10)
 
-    # bottom row: goal close-up with the projected subject box -> hindsight label -> the training pair
-    TX, TW = X0 + 0.14, 0.76
-    th = TW * 0.75
-    yg = Y0 + 0.14
-    cv.image(im_g, TX, yg, TW, th, ec=BLUE, lw=1.0, shadow=True)
-    cv.text(TX, yg + th + 0.04, r"goal $o_g$", size=5.8, ha="left", va="bottom", color=BLUE_D, weight="semibold")
+    # the walk's start and end frames, pinned beside the path
+    tw, th_ = 0.50, 0.375
+    xr = rect[0] + rect[2] - tw / 2 - 0.06
+    for A_, f_, yc_, ec_, lab in ((As, S_IDX, As[1] + OSTART_DY, INK, r"start $o_{26}$"),
+                                  (Ag, G_IDX, Ag[1] + OEND_DY, BLUE, r"end $o_g$ ($g=4$)")):
+        cv.line([A_[0] + 0.04, xr - tw / 2], [A_[1], yc_], color=ec_, lw=0.45, ls=(0, (1, 1.2)), z=4)
+        cv.image(load(D / f"renders/pair_{PAIR:02d}_frame_{f_:02d}.jpg", 400), xr - tw / 2, yc_ - th_ / 2, tw, th_,
+                 ec=ec_, lw=1.0, z=9.5, shadow=True)
+        cv.text(xr - tw / 2, yc_ + th_ / 2 + 0.03, lab, size=5.6, ha="left", va="bottom",
+                color=BLUE_D if ec_ == BLUE else INK, weight="semibold", z=10)
+    ye = Ag[1] + OEND_DY
+    cv.shutter(xr + tw / 2 - 0.05, ye - th_ / 2 + 0.05, r=0.032, z=10)
+    # the projected subject box on the end frame is where its label comes from
     bx = d["render_records"][PAIR][G_IDX]["bbox_xyxy_full"]
-    sx, sy = TW / 1024, th / 768
-    x0b, x1b = TX + bx[0] * sx, TX + min(bx[2], 1022) * sx
-    y0b, y1b = yg + th - bx[3] * sy, yg + th - bx[1] * sy
-    cv.ax.add_patch(Rectangle((x0b, y0b), x1b - x0b, y1b - y0b, fc="none", ec=BLUE, lw=0.8,
-                              ls=(0, (2.5, 1.5)), zorder=6))
-    cv.ax.scatter([(x0b + x1b) / 2], [(y0b + y1b) / 2], s=6, marker="+", color=BLUE, lw=0.8, zorder=6)
-    cv.line([Cg[:, 0].min(), TX + TW - 0.02], [Cg[:, 1].min(), yg + th + 0.01], color=BLUE, lw=0.45,
-            ls=(0, (1, 1.5)), z=3)
-    LX, LW = TX + TW + 0.14, 0.86
+    sx, sy = tw / 1024, th_ / 768
+    x0e, y0e = xr - tw / 2, ye - th_ / 2
+    cv.ax.add_patch(Rectangle((x0e + bx[0] * sx, y0e + th_ - bx[3] * sy), (min(bx[2], 1022) - bx[0]) * sx,
+                              (bx[3] - bx[1]) * sy, fc="none", ec=BLUE, lw=0.7, ls=(0, (2, 1.2)), zorder=9.7))
+    end_bottom = y0e
+
+    # bottom row: training pair and scale on the left; the end frame's hindsight label on the right
+    yg, th = Y0 + 0.12, 0.50
+    LW = 0.92
+    LX = xr + tw / 2 - LW
     cv.box(LX, yg, LW, th, fc="white", ec=BLUE, lw=0.8, r=0.05, shadow=True)
-    cv.text(LX + 0.06, yg + th - 0.09, r"label $p(o_g)$", size=5.8, color=BLUE_D, ha="left", weight="semibold")
-    cv.text(LX + 0.06, yg + th / 2 - 0.08, "bearing   222°\nelevation  −1°\noccupancy  18%\ncentre  895,351",
-            size=4.7, color=INK, ha="left", family="IBM Plex Mono", linespacing=1.28)
-    cv.arrow((TX + TW + 0.02, yg + th / 2), (LX - 0.01, yg + th / 2), color=BLUE, lw=0.7, ms=3.2)
-    QX = LX + LW + 0.12
-    cv.text(QX, yg + th - 0.02, "read off the projected mesh:\nno reward, no human label", size=5.0, color=MUTED,
-            ha="left", va="top", linespacing=1.2)
-    cv.text(QX, yg + 0.23, r"$(o_s, p(o_g))\mapsto(a_{s:s+8}, o_{s+1:s+8})$", size=6.0, ha="left",
+    cv.text(LX + 0.06, yg + th - 0.08, r"label $p(o_g)$", size=5.6, color=BLUE_D, ha="left", weight="semibold")
+    cv.text(LX + 0.06, yg + th / 2 - 0.07, "bearing   222°\nelevation  −1°\noccupancy  18%\ncentre  895,351",
+            size=4.5, color=INK, ha="left", family="IBM Plex Mono", linespacing=1.2)
+    cv.arrow((xr, end_bottom - 0.01), (xr, yg + th + 0.01), color=BLUE, lw=0.7, ms=3.2)
+    cv.text(xr - 0.05, (end_bottom + yg + th) / 2, "from the mesh", size=5.0, color=BLUE_D, ha="right")
+    QX = X0 + 0.14
+    cv.text(QX, yg + 0.62, "no reward, no human label:\nevery frame a flight reaches is a goal",
+            size=5.2, color=MUTED, ha="left", va="top", linespacing=1.2)
+    cv.text(QX, yg + 0.25, r"$(o_s,\ p(o_g))\ \mapsto\ (a_{s:s+8},\ o_{s+1:s+8})$", size=7.0, ha="left",
             va="bottom")
-    cv.text(QX, yg, "12 orbits × 32 frames / placement\n91 scenes × 102 subjects → 150k", size=4.9,
-            color=MUTED, ha="left", va="bottom", linespacing=1.2)
+    cv.text(QX, yg, "12 orbits × 32 frames per placement\n91 scenes × 102 subjects → 150k windows",
+            size=5.0, color=MUTED, ha="left", va="bottom", linespacing=1.2)
     return dict(D=D, traj=traj)
 
 
