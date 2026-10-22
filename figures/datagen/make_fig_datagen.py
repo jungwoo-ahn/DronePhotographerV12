@@ -42,12 +42,12 @@ FUNNEL = [("9,889", "scene × subject\nruns"), ("7,885", "placements\n(91 scenes
           ("75k", "trajectories\n(19 % kept)"), ("2.4M", "rendered\nframes"), ("150k", "training\nwindows")]
 
 
-def args():
+def args(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="/home/nas_main/jungwooahn/projects/DronePhotographerV12")
     ap.add_argument("--b", default="schematic", choices=["schematic", "real"],
                     help="panel (b): schematic grid, or the real re-run grid projected into the scene camera")
-    return ap.parse_args()
+    return ap.parse_args(argv)
 
 
 def traj_dir(root):
@@ -463,8 +463,8 @@ def funnel(cv):
         cv.text(x + 0.18 + 0.105 * len(num), y + h / 2, lab, size=4.8, ha="left", color=MUTED, linespacing=1.1)
 
 
-def main():
-    a = args()
+def build(a):
+    """The figure for parsed arguments `a` (see args()); returns the Canvas."""
     root = Path(a.root)
     cv = Canvas()
     cv.fig.set_size_inches(W, H)
@@ -476,6 +476,12 @@ def main():
     panel_render(cv, root)
     panel_windows(cv, root)
     funnel(cv)
+    return cv
+
+
+def main():
+    a = args()
+    cv = build(a)
     stem = "fig_datagen" + ("_realgrid" if a.b == "real" else "")
     for ext in ("pdf", "svg", "png"):
         cv.fig.savefig(HERE / f"{stem}.{ext}", dpi=300 if ext == "png" else None)

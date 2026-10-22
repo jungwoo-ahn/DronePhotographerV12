@@ -53,12 +53,12 @@ RH, PW3, FX0, FW, GAP = 1.10, 1.92, 2.04, 0.80, 0.045      # row height, 3-D pan
 W = 7.16
 
 
-def args():
+def args(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="/home/nas_main/jungwooahn/projects/DronePhotographerV12")
     ap.add_argument("--rows", default=None, help="comma-separated indices into EPISODES")
     ap.add_argument("--out", default="fig_rollouts")
-    return ap.parse_args()
+    return ap.parse_args(argv)
 
 
 def episode(bench, scores, rollouts, key):
@@ -191,8 +191,8 @@ def row(cv, y0, rh, data, title, view, first):
                               fc=(0.14, 0.52, 0.35, 0.9) if dd["succ"] else (0, 0, 0, 0.5), ec="none"))
 
 
-def main():
-    a = args()
+def build(a):
+    """The figure for parsed arguments `a` (see args()); returns the Canvas."""
     root = Path(a.root)
     bench = root / "runs/bench_v2"
     scores = json.load(open(bench / "scores.json"))
@@ -216,6 +216,12 @@ def main():
     cv.text(lx + 0.12, 0.08, "GT goal camera", size=5.4, ha="left")
     cv.text(W - 0.06, 0.08, "d: distance to the GT goal (success d ≤ 0.10 + subject visible, green)", size=5.2,
             color=MUTED, ha="right")
+    return cv
+
+
+def main():
+    a = args()
+    cv = build(a)
     for ext in (("png",) if a.rows else ("pdf", "svg", "png")):
         cv.fig.savefig(HERE / f"{a.out}.{ext}", dpi=300 if ext == "png" else None)
     print("wrote", HERE / f"{a.out}.png")

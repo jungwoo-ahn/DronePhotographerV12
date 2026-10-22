@@ -67,7 +67,7 @@ OSTART_DY, OEND_DY = -0.02, -0.34                            # start/end thumbna
 AZ, EL, RV, DIST = 35, 28, 4.5, 18                      # 3-D view of panel (a)
 
 
-def args():
+def args(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="/home/nas_main/jungwooahn/projects/DronePhotographerV12")
     ap.add_argument("--view", default=None, help="az,el,radius,dist to try another 3-D view of panel (a)")
@@ -75,7 +75,7 @@ def args():
     ap.add_argument("--a-style", default="orbits", choices=["orbits", "behind"],
                     help="panel (a): all orbits from above, or the view from behind the cameras")
     ap.add_argument("--orbit-view", default=None, help="az,el,dist for the orbit overview")
-    return ap.parse_args()
+    return ap.parse_args(argv)
 
 
 # ---------------------------------------------------------------- primitives
@@ -731,9 +731,9 @@ def panel_c(cv, root):
             size=5.0, color=MUTED, ha="right", style="italic")
 
 
-def main():
+def build(a):
+    """The figure for parsed arguments `a` (see args()); returns the matplotlib Figure."""
     global AZ, EL, RV, DIST, OAZ, OEL, ODIST
-    a = args()
     root = Path(a.root)
     if a.view:
         AZ, EL, RV, DIST = map(float, a.view.split(","))
@@ -743,6 +743,12 @@ def main():
     assets = (panel_a_orbits if a.a_style == "orbits" else panel_a_behind)(cv, root)
     panel_b(cv, assets)
     panel_c(cv, root)
+    return cv
+
+
+def main():
+    a = args()
+    cv = build(a)
     for ext in (("png",) if (a.view or a.orbit_view) else ("pdf", "svg", "png")):
         cv.fig.savefig(HERE / f"{a.out}.{ext}", dpi=300 if ext == "png" else None)
     print("wrote", HERE / f"{a.out}.png")
